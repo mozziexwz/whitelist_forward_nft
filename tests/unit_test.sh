@@ -24,6 +24,16 @@ get_listening_ports() {
     return 0
 }
 
+# 只看环境变量，不沿父进程查找：否则通过 SSH 运行测试时会读到真实的连接
+# （父进程查找本身在下面单独测试）
+get_ssh_connection() {
+    if [ -n "${SSH_CONNECTION:-}" ]; then
+        printf '%s' "$SSH_CONNECTION"
+    elif [ -n "${SSH_CLIENT:-}" ]; then
+        awk '{print $1, $2, "-", $3}' <<< "$SSH_CLIENT"
+    fi
+}
+
 PASS=0
 FAIL=0
 
@@ -190,6 +200,12 @@ eq "IPv4 映射地址"        "203.0.113.9"  "$(SSH_CONNECTION='::ffff:203.0.113
 eq "IPv6 去掉 zone"       "fe80::1"      "$(SSH_CONNECTION='fe80::1%eth0 50000 fe80::2 22' get_current_ssh_ip)"
 eq "只有 SSH_CLIENT"      "203.0.113.9"  "$(SSH_CLIENT='203.0.113.9 50000 22' get_current_ssh_ip)"
 has "SSH 服务端口"        "$(SSH_CONNECTION='203.0.113.9 50000 10.0.0.1 2222' get_ssh_ports)" "2222"
+if [ "$(uname -s)" = "Linux" ] && [ -r "/proc/$$/environ" ]; then
+    # 模拟 sudo：父进程有 SSH_CONNECTION，脚本自己的环境里没有（依赖 Linux 的 /proc）
+    got=$(env SSH_CONNECTION="198.51.100.20 40000 10.0.0.1 22" bash -c \
+        'env -u SSH_CONNECTION -u SSH_CLIENT bash -c "source \"\$1\"; get_ssh_connection" _ "$1"' _ "$ROOT/nft.sh")
+    eq "sudo 后沿父进程找到 SSH 连接" "198.51.100.20 40000 10.0.0.1 22" "$got"
+fi
 
 # ---------------------------------------------------------------- 转发校验
 printf '10000-10002|192.0.2.10|20000-20002\n' > "$NFT_SH_FORWARD_FILE"

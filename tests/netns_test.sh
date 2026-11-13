@@ -22,7 +22,10 @@ TGT=nfttest_tgt
 PASS=0
 FAIL=0
 PIDS=()
-RUN_ENV=()
+# 模拟管理员从客户端 10.10.1.2 通过 SSH 登录中转机。必须显式设置：
+# 否则通过 SSH 运行本测试时，nft.sh 会沿父进程读到真实的 SSH 连接
+DEFAULT_ENV=("SSH_CONNECTION=10.10.1.2 50000 10.10.1.1 22")
+RUN_ENV=("${DEFAULT_ENV[@]}")
 
 export NFT_SH_WHITELIST_FILE="$WORK/whitelist.txt"
 export NFT_SH_FORWARD_FILE="$WORK/forward.conf"
@@ -247,7 +250,7 @@ main() {
     RUN_ENV=("SSH_CONNECTION=10.10.1.2 50000 10.10.1.1 2222")
     run_fail "拒绝转发 SSH 端口" add-forward 2222 10.10.2.2 22
     run_fail "非交互模式拒绝删除当前 SSH 来源 IP" del-ip 10.10.1.2
-    RUN_ENV=()
+    RUN_ENV=("${DEFAULT_ENV[@]}")
     check    "被拒绝后白名单保持不变" grep -qx "10.10.1.2" "$NFT_SH_WHITELIST_FILE"
     check    "添加转发时自动开启 IPv4 转发" test "$(ip netns exec "$RELAY" cat /proc/sys/net/ipv4/ip_forward)" = "1"
 
