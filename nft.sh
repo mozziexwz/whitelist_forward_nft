@@ -1891,7 +1891,8 @@ apply_all_rules() {
     else
         echo -e "${GREEN}✓ 规则已应用 - 白名单${RED}[关闭]${GREEN}，转发 ${fw_count} 条（TCP+UDP）${NC}"
     fi
-    if [ "$fw_count" -gt 0 ] && ! ip_forward_enabled; then
+    if [ "$fw_count" -gt 0 ] && ! ip_forward_enabled &&
+        list_forwards | awk '$6 == "ipv4" || index($3, ":") == 0 { needed=1 } END { exit !needed }'; then
         warn "注意: IPv4 转发 (net.ipv4.ip_forward) 未开启，端口转发不会生效，请在菜单中选择 7 开启"
     fi
     return 0
