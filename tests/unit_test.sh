@@ -650,6 +650,31 @@ ok "支持同系列后续版本" translation_version_supported 4.1.16
 no "拒绝未通过分片验收的旧 Jool" translation_version_supported 4.1.13.0
 no "拒绝未经验证的新主版本" translation_version_supported 5.0.0
 no "拒绝无效模块版本" translation_version_supported '4.1.foo'
+context_roundtrip() (
+    mkdir "$WORK/context-roundtrip"
+    WHITELIST_FILE='literal $(touch should-not-run) with spaces'
+    NFT_SH_XLATE_ID=custom1; NFT_SH_XLATE_V4=198.19.236; NFT_SH_XLATE_V6=fd73:7465:7374
+    save_rollback_context "$WORK/context-roundtrip" || exit 1
+    WHITELIST_FILE=changed; NFT_SH_XLATE_ID=changed
+    load_rollback_context "$WORK/context-roundtrip" || exit 1
+    [ "$WHITELIST_FILE" = 'literal $(touch should-not-run) with spaces' ] &&
+        [ "$NFT_SH_XLATE_ID" = custom1 ] && [ "$NFT_SH_XLATE_V4" = 198.19.236 ] && [ "$NFT_SH_XLATE_V6" = fd73:7465:7374 ]
+)
+context_invalid() (
+    local dir="$WORK/context-$1"
+    mkdir "$dir"
+    save_rollback_context "$dir" || exit 0
+    case "$1" in
+        unknown) printf 'UNKNOWN\0value\0' >> "$dir/context" ;;
+        duplicate) printf 'FORWARD_FILE\0value\0' >> "$dir/context" ;;
+        truncated) printf 'FORWARD_FILE\0' > "$dir/context" ;;
+    esac
+    load_rollback_context "$dir"
+)
+ok "回滚上下文保留自定义部署及字面值" context_roundtrip
+no "回滚上下文拒绝未知变量" context_invalid unknown
+no "回滚上下文拒绝重复变量" context_invalid duplicate
+no "回滚上下文拒绝截断数据" context_invalid truncated
 if [ "$(type -t flock)" = file ]; then
     begin_action
     no "拒绝并发配置事务" bash -c 'source "$1"; trap end_action EXIT; begin_action' _ "$ROOT/nft.sh"

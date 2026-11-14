@@ -39,6 +39,9 @@ export NFT_SH_ENABLED_FILE="$WORK/enabled"
 export NFT_SH_PERSIST_DIR="$WORK/nftables.d"
 export NFT_SH_MAIN_CONF="$WORK/nftables.conf"
 export NFT_SH_SYSCTL_FILE="$WORK/sysctl-forward.conf"
+export NFT_SH_TRANSLATE_DIR="$WORK/translate"
+export NFT_SH_LIBEXEC_DIR="$WORK/libexec"
+export NFT_SH_SYSTEMD_DIR="$WORK/systemd"
 unset SSH_CONNECTION SSH_CLIENT
 
 # 假的 systemctl：不让测试去启用宿主机的 nftables.service

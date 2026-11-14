@@ -38,6 +38,10 @@ LIBEXEC_DIR="${NFT_SH_LIBEXEC_DIR:-/usr/local/libexec/nft-sh}"
 SYSTEMD_DIR="${NFT_SH_SYSTEMD_DIR:-/etc/systemd/system}"
 XL_ID="" XL4="" XL6=""
 ACTION_LOCK_FD=""
+ROLLBACK_CONTEXT_KEYS=(WHITELIST_FILE FORWARD_FILE WHITELIST_ENABLED_FILE NFT_TABLE
+    NFT_PERSIST_DIR NFT_PERSIST_FILE NFT_INCLUDE_LINE NFT_MAIN_CONF SYSCTL_FILE
+    TRANSLATE_DIR TRANSLATE_DEPLOY LIBEXEC_DIR SYSTEMD_DIR NFT_SH_LOCK_FILE
+    NFT_SH_XLATE_ID NFT_SH_XLATE_V4 NFT_SH_XLATE_V6)
 
 # 旧版本脚本用过的表，应用规则时一并删除；其他程序和用户自己的表（如 inet filter）不会被改动
 LEGACY_TABLES=(whitelist_filter port_forward unified_filter unified_nat)
@@ -1461,9 +1465,39 @@ restore_snapshot() {
     return $rc
 }
 
+save_rollback_context() {
+    local key
+    for key in "${ROLLBACK_CONTEXT_KEYS[@]}"; do
+        printf '%s\0%s\0' "$key" "${!key-}" || return 1
+    done > "$1/context"
+}
+
+load_rollback_context() {
+    local key value
+    local -A values=()
+    [ -f "$1/context" ] || return 0
+    while IFS= read -r -d '' key; do
+        IFS= read -r -d '' value || return 1
+        case "$key" in
+            WHITELIST_FILE|FORWARD_FILE|WHITELIST_ENABLED_FILE|NFT_TABLE|NFT_PERSIST_DIR|NFT_PERSIST_FILE|NFT_INCLUDE_LINE|NFT_MAIN_CONF|SYSCTL_FILE|TRANSLATE_DIR|TRANSLATE_DEPLOY|LIBEXEC_DIR|SYSTEMD_DIR|NFT_SH_LOCK_FILE|NFT_SH_XLATE_ID|NFT_SH_XLATE_V4|NFT_SH_XLATE_V6) ;;
+            *) return 1 ;;
+        esac
+        [ -z "${values[$key]+present}" ] || return 1
+        values[$key]="$value"
+    done < "$1/context"
+    [ -z "$key" ] || return 1
+    [ "${#values[@]}" -eq "${#ROLLBACK_CONTEXT_KEYS[@]}" ] || return 1
+    for key in "${ROLLBACK_CONTEXT_KEYS[@]}"; do
+        printf -v "$key" '%s' "${values[$key]}" || return 1
+    done
+}
+
 # 在独立于当前 SSH 会话的后台安排回滚：即使连接断开、脚本被终止，也会按时回滚
 schedule_rollback_guard() {
     local snap="$1" delay="$2" self="$1/nft.sh"
+    # systemd-run does not inherit shell configuration. Store only known data
+    # fields, including first-deployment parameters not yet persisted to disk.
+    save_rollback_context "$snap" || return 1
     if [ ! -f "$SCRIPT_PATH" ] || ! cp -f "$SCRIPT_PATH" "$self" 2>/dev/null || [ ! -s "$self" ]; then
         return 1
     fi
@@ -1493,6 +1527,7 @@ rollback_guard() {
         *) return 1 ;;
     esac
     [ -d "$snap" ] || return 0
+    load_rollback_context "$snap" || return 1
     if [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ]; then
         for ((i = 0; i < delay; i++)); do
             [ -d "$snap" ] || return 0

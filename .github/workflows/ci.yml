@@ -55,6 +55,8 @@ jobs:
         run: sudo env CI=true bash scripts/ci_install_jool.sh
       - name: Run real dual-stack kernel forwarding tests
         run: sudo bash tests/kernel_netns_test.sh
+      - name: Verify actual systemd rollback of custom kernel deployment
+        run: sudo bash tests/kernel_systemd_test.sh
 
   coexistence:
     name: Integration tests (Docker and WireGuard)
