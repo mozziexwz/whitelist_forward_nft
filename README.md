@@ -34,13 +34,20 @@
 - 使用跨族规则还需要 **版本匹配的 Jool 4.1.15 或更新的 4.1 系列工具和内核模块**、namespace/veth 和两族 forwarding 权限，开机恢复需要 systemd
 - VPS 必须具备入口族可达地址及通往目标族的地址和路由；受限容器 VPS 可能无法加载模块。同族规则不需要安装 Jool
 
-Debian/Ubuntu 先准备当前运行内核的 headers 和构建工具：
+跨族转发首次使用前，在 VPS 上运行：
 
 ```bash
-sudo apt install build-essential dkms "linux-headers-$(uname -r)"
+sudo bash nft.sh install-jool
+bash nft.sh check-jool
 ```
 
-随后按 [Jool 4.1.15 官方发行页](https://github.com/NICMx/Jool/releases/tag/v4.1.15)安装匹配的 `jool-dkms` 和 `jool-tools`，核对下载校验值。发行版内置的旧版本可能不足要求；4.1.13 未通过本项目低 MTU UDP 验收，因此跨族预检会拒绝低于 4.1.15 的版本。
+也可在菜单选择 **13 安装跨族转发依赖**、**14 检查跨族转发依赖**。普通 `apply` 不会自动安装系统软件；缺少依赖时会打印这两个命令。安装成功后重新添加之前失败的转发，或重新应用已有配置；失败的添加操作已恢复原配置，需重新添加。
+
+安装器支持 Debian/Ubuntu，以及提供 `dkms` 的 RHEL 系软件源（Rocky/AlmaLinux 等通常需先配置 EPEL）。它安装**当前运行内核**的 headers/devel 和构建依赖，下载 [Jool 4.1.15 官方源码](https://github.com/NICMx/Jool/releases/tag/v4.1.15)，核对固定 SHA256，编译工具到 `/usr/local`，通过 DKMS 安装并实际加载模块。不会升级/重启内核，也不启用通用 `jool.service` 或同步守护进程；安装操作不修改本项目防火墙和转发配置，已安装的构建依赖不随规则回滚卸载。源码构建使用本机架构，工具与模块均须编译成功。
+
+已有版本匹配且符合要求的 Jool 时直接复用；已有其他版本的工具、磁盘模块或已加载模块时停止并提示维护升级，避免覆盖软件包或卸载正在使用的转换模块。发行版内置的旧版本可能不足要求；4.1.13 未通过本项目低 MTU UDP 验收，因此跨族预检会拒绝低于 4.1.15 的版本。手动安装也可使用官方匹配的 `jool-dkms` / `jool-tools` 包。
+
+如安装失败，运行 `bash nft.sh check-jool` 获取具体缺项。缺少当前内核 headers/devel 时请修复软件源或自行安排更新内核后再试；受限容器、模块签名不被信任或内核不兼容时，DKMS 构建或模块加载仍会失败，安装器会保留实际错误并停止。其他发行版按 [Jool 官方安装说明](https://www.jool.mx/en/install.html)操作。
 
 必须确认 DKMS 为**当前运行内核**成功构建，工具、磁盘模块和已加载模块版本一致；不需要启用发行版的通用 `jool.service`。本项目只创建自己的转换实例。其他发行版需按 [Jool 官方说明](https://www.jool.mx/en/documentation.html)准备适配模块，不能仅凭内核 ≥ 5.2 判断跨族功能可用。内核升级后也需确认模块重建成功。
 
@@ -68,7 +75,7 @@ sha256sum -c SHA256SUMS && sudo bash nft.sh
 ```
 
 脚本修改规则时需要 root 身份；普通用户使用 `sudo bash nft.sh`（脚本能在 sudo 下正确识别你的 SSH 来源 IP）。下文的命令同理。
-`help`、`version`、`print-rules` 和 `print-plan` 不主动修改系统。预览不要求安装 nftables/Jool，但需要能够读取声明及部署配置；系统部署目录仅 root 可访问时，请用 `sudo` 预览。
+`help`、`version`、`check-jool`、`print-rules` 和 `print-plan` 不主动修改系统。预览不要求安装 nftables/Jool，但需要能够读取声明及部署配置；系统部署目录仅 root 可访问时，请用 `sudo` 预览。
 
 首次运行会检测你的 SSH 来源 IP 并建议加入白名单。**白名单默认启用**，请务必先把自己的 IP 加进去。
 
@@ -85,6 +92,8 @@ nft.sh add-forward [--listen-family ipv4|ipv6] <本地端口> <目标IP> <目标
                                            添加 TCP+UDP 转发，端口可写成段，如 10000-10010
 nft.sh del-forward [--listen-family ipv4|ipv6] <本地端口>
 nft.sh ip-forward                          开启 IPv4 转发
+nft.sh install-jool                        安装并验证跨族依赖，不应用防火墙
+nft.sh check-jool                          只读检查 Jool 工具、当前内核和模块
 nft.sh print-rules                         只打印将要应用的 nftables 规则，不做任何修改
 nft.sh print-plan                          预览 nft、Jool 配置及环境要求
 ```
@@ -178,6 +187,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 ## 开发与测试
 
 - `bash tests/unit_test.sh`：纯 bash 单元测试，不需要 root，Windows 的 Git Bash 也能运行
+- `sudo bash tests/jool_install_test.sh`：19 项隔离依赖测试；模拟安装工具，验证缺项、版本冲突、下载/校验/DKMS/加载失败及重复安装，不安装系统软件
 - `sudo bash tests/netns_test.sh`：在隔离的 network namespace 里真实加载规则，测试转发和白名单；不改动宿主机的防火墙、`/etc` 和 systemd 服务
 - `sudo bash tests/kernel_netns_test.sh`：需已安装匹配的 Jool 工具/模块，在隔离 network/mount namespace 中验证四方向 TCP/UDP、端口段、重复目标、白名单、绕过路径、大包及实例故障恢复
 - `sudo bash tests/kernel_netns_test.sh --same-ports`：额外验证四方向同号端口段保持端口
@@ -206,6 +216,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 - 新增入口族选择、完整计划预览、严格部署参数、实例/池/BIB/路由检查及 oneshot 启动恢复
 - 扩展白名单隔离、并发锁、跨组件快照和断连回滚；IPv6 forwarding 保留上联 RA
 - 新增固定 Jool CI、真实双栈公网和重启验收；重建实例会影响既有连接，未承诺容量或吞吐
+- 补齐 `install-jool` / `check-jool` 和菜单依赖安装入口；CI 使用与用户相同的官方源码 + DKMS 安装流程
 
 ### v2.0.0（2026-11-14，首次正式发布）
 

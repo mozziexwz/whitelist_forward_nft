@@ -671,8 +671,162 @@ translation_version_supported() {
     [[ "$1" =~ ^4\.1\.([0-9]+)(\.[0-9]+)?$ ]] && [ "$((10#${BASH_REMATCH[1]}))" -ge 15 ]
 }
 
+jool_install_hint() {
+    printf '安装依赖: sudo bash %q install-jool\n' "$SCRIPT_PATH"
+    printf '只读诊断: bash %q check-jool\n' "$SCRIPT_PATH"
+}
+
+jool_loaded_version() {
+    cat "/sys/module/$1/version" 2>/dev/null
+}
+
+# Read-only: finding a module on disk does not prove the VPS permits loading it.
+check_jool() {
+    local tool value disk loaded module missing=0
+    for tool in ip ss nsenter jool modprobe modinfo; do
+        if ! command -v "$tool" >/dev/null; then
+            error "跨族转发缺少命令: $tool"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ] || return 1
+    value=$(jool --version) || { error '无法运行 jool --version'; return 1; }
+    disk=$(modinfo -F version jool 2>/dev/null) || {
+        error "当前内核 $(uname -r) 没有可用 Jool 模块，需要匹配的 headers 和 DKMS 构建"; return 1;
+    }
+    translation_version_supported "$value" && [ "$value" = "$disk" ] || {
+        error "需要 Jool 4.1.15 或更新的 4.1 版本且工具与模块一致（工具: $value；磁盘模块: $disk）"; return 1;
+    }
+    for module in jool_common jool jool_siit; do
+        loaded=$(jool_loaded_version "$module") || continue
+        if [ "$value" != "$loaded" ]; then
+            error "已加载的 $module 版本 $loaded 与工具 $value 不同，请在维护时升级模块"; return 1
+        fi
+    done
+    modprobe -n jool >/dev/null 2>&1 || {
+        error "当前内核 $(uname -r) 的 Jool 模块或依赖不可用，请检查 modprobe -n -v jool"; return 1;
+    }
+    info "Jool 工具 / 当前内核磁盘模块: $value / $disk"
+    if loaded=$(jool_loaded_version jool); then
+        info "已加载 Jool 模块: $loaded"
+    else
+        warn 'Jool 模块尚未加载；只读检查未验证模块加载权限，install-jool 会实际加载验证'
+    fi
+}
+
+jool_install_platform() {
+    local id
+    id=$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '\042\047')
+    case "$id" in
+        debian|ubuntu) echo debian ;;
+        rocky|almalinux|rhel|centos|fedora) echo rhel ;;
+        *) error "暂不自动安装此系统 ($id) 的 Jool，请按 https://www.jool.mx/en/install.html 安装" >&2; return 1 ;;
+    esac
+}
+
+jool_install_dependencies() {
+    local platform="$1" kernel="$2"
+    case "$platform" in
+        debian)
+            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-remove -y \
+                build-essential pkg-config libnl-genl-3-dev dkms "linux-headers-$kernel" \
+                curl ca-certificates iproute2 util-linux kmod || {
+                error "构建依赖安装失败；请确认软件源提供当前内核的 linux-headers-$kernel 后重试"; return 1;
+            }
+            ;;
+        rhel)
+            dnf install -y gcc make pkgconf-pkg-config libnl3-devel dkms "kernel-devel-$kernel" \
+                elfutils-libelf-devel curl ca-certificates iproute util-linux kmod || {
+                error "构建依赖安装失败；请确认已配置提供 dkms 的仓库（如 EPEL）和 kernel-devel-$kernel 后重试"; return 1;
+            }
+            ;;
+        *) return 1 ;;
+    esac
+    [ -f "/lib/modules/$kernel/build/Makefile" ] || {
+        error "缺少当前内核 $kernel 的构建目录；请安装匹配的 headers/devel 后重试"; return 1;
+    }
+}
+
+# Explicit installation only, outside firewall transactions and boot restoration.
+# Build the pinned upstream source to avoid distribution packages starting their
+# generic Jool services. DKMS retains the source for future kernel rebuilds.
+install_jool() (
+    local platform kernel work="" fd tool value module build_tools=1 build_module=1
+    local expected=4.1.15.0 base=https://github.com/NICMx/Jool/releases/download/v4.1.15
+    [ "$EUID" -eq 0 ] || { error '安装 Jool 需要 root，请使用 sudo bash nft.sh install-jool'; return 1; }
+    if check_jool >/dev/null 2>&1; then
+        modprobe jool || { error '模块加载失败，请检查 VPS 模块权限、内核签名或 Secure Boot 设置'; return 1; }
+        check_jool
+        return $?
+    fi
+    platform=$(jool_install_platform) || return 1
+    kernel=$(uname -r)
+    # Never replace an existing translator, unload modules, or mix source and
+    # package versions. Matching partial installs can be completed safely.
+    if command -v jool >/dev/null; then
+        value=$(jool --version) || return 1
+        [ "$value" = "$expected" ] || {
+            error "已有 Jool 工具 $value；自动安装不会覆盖其他版本，请先在维护时升级到匹配版本"; return 1;
+        }
+        build_tools=0
+    fi
+    if command -v modinfo >/dev/null && value=$(modinfo -F version jool 2>/dev/null); then
+        [ "$value" = "$expected" ] || {
+            error "当前内核已有 Jool 磁盘模块 $value；请先在维护时升级，自动安装不会覆盖它"; return 1;
+        }
+        build_module=0
+    fi
+    for module in jool_common jool jool_siit; do
+        if value=$(jool_loaded_version "$module"); then
+            [ "$value" = "$expected" ] || {
+                error "已加载的 $module 是 $value；请在维护时升级，自动安装不会卸载在用模块"; return 1;
+            }
+        fi
+    done
+    command -v flock >/dev/null || { error '安装需要 util-linux 的 flock'; return 1; }
+    exec {fd}<> /run/lock/nft-sh-jool-install.lock || return 1
+    flock -n "$fd" || { error '另一项 Jool 安装正在进行，请稍后重试'; return 1; }
+    info "安装 Jool 4.1.15，当前内核: $kernel（编译可能需要几分钟）"
+    jool_install_dependencies "$platform" "$kernel" || return 1
+    for tool in curl sha256sum tar make dkms modprobe modinfo ldconfig; do
+        command -v "$tool" >/dev/null || { error "依赖安装后仍缺少 $tool"; return 1; }
+    done
+    if [ "$build_tools" -eq 1 ] || [ "$build_module" -eq 1 ]; then
+        work=$(mktemp -d "${TMPDIR:-/tmp}/nft-sh-jool.XXXXXXXX") || return 1
+        trap 'rm -rf -- "$work"' EXIT
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 \
+            "$base/jool-4.1.15.tar.gz" -o "$work/jool.tar.gz" || {
+            error '下载 Jool 官方源码失败，请检查到 GitHub 的网络后重试'; return 1;
+        }
+        printf '%s  %s\n' 51604bcf6a9f7fbb9080876102d05da01dc91d8c73cd5828fd73d5895643f8cd "$work/jool.tar.gz" | sha256sum -c - || {
+            error 'Jool 源码 SHA256 不匹配，已停止安装'; return 1;
+        }
+        tar -xzf "$work/jool.tar.gz" -C "$work" || return 1
+        if [ "$build_tools" -eq 1 ]; then
+            (cd "$work/jool-4.1.15" && ./configure --prefix=/usr/local --with-xtables=no --with-bash-completion-dir=no && make -j2) || {
+                error 'Jool 工具编译失败，尚未安装工具'; return 1;
+            }
+        fi
+        if [ "$build_module" -eq 1 ]; then
+            if [ -n "$(dkms status -m jool -v 4.1.15)" ]; then
+                dkms install -m jool -v 4.1.15 -k "$kernel"
+            else
+                dkms install "$work/jool-4.1.15" -k "$kernel"
+            fi || { error 'Jool DKMS 构建失败，请查看 /var/lib/dkms/jool/4.1.15/ 下的 make.log'; return 1; }
+        fi
+        if [ "$build_tools" -eq 1 ]; then
+            make -C "$work/jool-4.1.15" install && ldconfig && hash -r || return 1
+        fi
+    fi
+    modprobe jool || {
+        error 'Jool 已安装但加载失败：请检查 VPS 模块权限、签名及 dmesg；脚本不会关闭 Secure Boot 或更换内核'; return 1;
+    }
+    check_jool || return 1
+    info 'Jool 依赖已就绪。请重新执行之前的转发操作；安装命令不会应用防火墙规则。'
+)
+
 translation_precheck() {
-    local tool mode route prefix other value ls le tip ts te family af
+    local mode route prefix other value ls le tip ts te family af
     translation_settings "$TRANSLATE_DEPLOY" || { error '错误: 内核转换部署配置无效'; return 1; }
     if [ -L "$SYSTEMD_DIR/nft-sh-translate.service" ] || [ -L "$LIBEXEC_DIR/nft.sh" ]; then
         error '受管服务或脚本路径为符号链接，已拒绝覆盖'; return 1
@@ -689,17 +843,7 @@ translation_precheck() {
         error '转换资源仍在使用旧部署参数；请先删除跨族规则，再修改部署参数'
         return 1
     fi
-    for tool in ip ss nsenter jool modprobe modinfo; do
-        command -v "$tool" >/dev/null || { error "跨族转发需要 $tool（Jool 工具和匹配的内核模块）"; return 1; }
-    done
-    modprobe -n jool >/dev/null 2>&1 || { error "当前内核 $(uname -r) 没有可用 Jool 模块，请安装匹配的 DKMS/headers"; return 1; }
-    value=$(jool --version) || return 1
-    translation_version_supported "$value" && [ "$value" = "$(modinfo -F version jool)" ] || {
-        error '需要 Jool 4.1.15 或更新的 4.1 版本，且工具和模块版本一致；旧版未通过低 MTU UDP 验收'; return 1;
-    }
-    if [ -f /sys/module/jool/version ] && [ "$value" != "$(cat /sys/module/jool/version)" ]; then
-        error '已加载的 Jool 模块与工具版本不同，请先安排模块升级再使用跨族转发'; return 1
-    fi
+    check_jool || { jool_install_hint; return 1; }
     for mode in 64 46; do
         if ip netns list | awk '{print $1}' | grep -qxF "$XL_ID$mode"; then
             translation_resource_owned "$mode" || { error "namespace $XL_ID$mode 不属于本项目"; return 1; }
@@ -2555,9 +2699,11 @@ main_menu() {
         echo -e "${GREEN}10.${NC} 清除所有规则"
         echo -e "${GREEN}11.${NC} 导出配置"
         echo -e "${GREEN}12.${NC} 导入配置"
+        echo -e "${GREEN}13.${NC} 安装跨族转发依赖(Jool)"
+        echo -e "${GREEN}14.${NC} 检查跨族转发依赖"
         echo -e "${GREEN}0.${NC} 退出"
         echo ""
-        echo -ne "选择 [0-12]: "
+        echo -ne "选择 [0-14]: "
         if ! read -r choice; then
             echo ""
             exit 0
@@ -2587,6 +2733,8 @@ main_menu() {
             10) clear_all_rules ;;
             11) export_config ;;
             12) import_config ;;
+            13) install_jool ;;
+            14) check_jool || jool_install_hint ;;
             0) echo ""; exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -2656,6 +2804,8 @@ nft.sh $VERSION - nftables 白名单防火墙 + 端口转发管理脚本
                                           添加 TCP+UDP 转发，端口可以写成段，如 10000-10010
   $me del-forward [--listen-family ipv4|ipv6] <本地端口>
   $me ip-forward                          开启 IPv4 转发
+  $me install-jool                        安装并验证 Jool 依赖（不应用防火墙）
+  $me check-jool                          只读检查跨族工具、当前内核及模块版本
   $me print-rules                         只打印将要应用的 nftables 规则，不做任何修改
   $me print-plan                          只读预览 nft、内核转换配置及环境要求
   $me help | version
@@ -2794,6 +2944,18 @@ main() {
         version|-v|--version)
             echo "nft.sh $VERSION"
             exit 0
+            ;;
+        check-jool)
+            [ $# -eq 1 ] || { usage >&2; exit 2; }
+            printf '内核: %s；架构: %s\n' "$(uname -r)" "$(uname -m)"
+            check_jool && exit 0
+            jool_install_hint
+            exit 1
+            ;;
+        install-jool)
+            [ $# -eq 1 ] || { usage >&2; exit 2; }
+            install_jool
+            exit $?
             ;;
     esac
 

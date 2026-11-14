@@ -2,7 +2,7 @@
 
 日期：2026-11-14。分支：`codex/ipv6-kernel-forwarding`。本次交付包含 IPv6→IPv6、IPv6→IPv4、IPv4→IPv6；旧 IPv4→IPv4 继续保留。版本为开发版，正式 v2.0.0 的标签和附件未替换。
 
-本次最终脚本 SHA256：`46f7d8520ad75af6ba10fd74c5784efe947fafeff152c7b5f5340192760b6943`。
+转发核心及下述真实重启验收脚本 SHA256：`46f7d8520ad75af6ba10fd74c5784efe947fafeff152c7b5f5340192760b6943`。后续依赖安装补充见文末记录。
 
 ## 实现前后
 
@@ -74,7 +74,7 @@ Rocky 的 `initrc_t` 服务域会拒绝 `ip -n` / `ip netns exec` 隐式重挂 `
 | `jool-tools_4.1.15-1_amd64.deb` | `ad4707e00db184303693fb1ec8161137ba9c1d37b252a74fc805136a88750479` |
 | `jool-4.1.15.tar.gz` | `51604bcf6a9f7fbb9080876102d05da01dc91d8c73cd5828fd73d5895643f8cd` |
 
-下载来源：[Jool 官方发行页](https://github.com/NICMx/Jool/releases/tag/v4.1.15)。CI 在一次性 Ubuntu runner 上校验 DEB、构建当前内核模块并执行实际数据测试；不能加载模块时整个 job 失败，不以跳过计为成功。
+下载来源：[Jool 官方发行页](https://github.com/NICMx/Jool/releases/tag/v4.1.15)。最初 CI 校验 DEB、构建当前内核模块并执行实际数据测试；依赖安装补充后改为直接执行用户的 `install-jool`，使用表中固定的官方源码校验值。不能加载模块时整个 job 失败，不以跳过计为成功。
 
 4.1.15 的 pool4 重叠检查会警告完整端口池与内核临时端口范围相交。本项目只在新建、专用且没有 TCP/UDP socket 的 namespace 中使用 `--force` 装载池；池地址不绑定网卡，不在宿主 namespace 绕过该检查。
 
