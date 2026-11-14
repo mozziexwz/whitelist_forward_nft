@@ -39,6 +39,9 @@ export NFT_SH_ENABLED_FILE="$WORK/enabled"
 export NFT_SH_PERSIST_DIR="$WORK/nftables.d"
 export NFT_SH_MAIN_CONF="$WORK/nftables.conf"
 export NFT_SH_SYSCTL_FILE="$WORK/sysctl-forward.conf"
+export NFT_SH_TRANSLATE_DIR="$WORK/translate"
+export NFT_SH_LIBEXEC_DIR="$WORK/libexec"
+export NFT_SH_SYSTEMD_DIR="$WORK/systemd"
 unset SSH_CONNECTION SSH_CLIENT
 
 # 假的 systemctl：不让测试去启用宿主机的 nftables.service
@@ -275,10 +278,12 @@ EOF
     # 后台 setsid 任务必须保留中转机命名空间，且在前台退出后仍能恢复规则。
     mkfifo "$WORK/confirm.fifo"
     exec {confirm_fd}<>"$WORK/confirm.fifo"
+    : > "$WORK/rollback.log"
+    rm -f "$WORK/rollback.snapshot" "$WORK/rollback.pid"
     run_rollback_driver < "$WORK/confirm.fifo" > "$WORK/rollback.log" 2>&1 &
     driver_pid=$!
     PIDS+=("$driver_pid")
-    for ((i = 0; i < 30; i++)); do
+    for ((i = 0; i < 200; i++)); do
         if grep -q '确认正常请在' "$WORK/rollback.log"; then ready=1; break; fi
         sleep 0.05
     done

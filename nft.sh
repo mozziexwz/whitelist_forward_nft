@@ -4,12 +4,12 @@
 #
 #   - 白名单：启用后只有白名单 IP 能访问本机和转发端口
 #   - 端口转发：单端口 / 端口段，TCP+UDP，本地端口段与目标端口段一一对应
-#   - 规则一次性原子加载：要么全部生效，要么保持原样，不会只生效一半
+#   - nft 规则在单个事务中加载；跨族内核资源按阶段保护，失败恢复
 #   - 防失联：应用前检查当前 SSH 来源 IP；修改白名单后限时确认，超时自动回滚
 #
 # 不带参数运行进入交互菜单；运行 "bash nft.sh help" 查看命令行用法。
 
-VERSION="2.0.0"
+VERSION="2.1.0"
 
 # 颜色定义
 RED='\033[0;31m'
@@ -32,6 +32,16 @@ NFT_PERSIST_FILE="$NFT_PERSIST_DIR/unified.nft"
 NFT_INCLUDE_LINE="include \"$NFT_PERSIST_FILE\""
 NFT_MAIN_CONF="${NFT_SH_MAIN_CONF:-}"     # 为空时自动检测
 SYSCTL_FILE="${NFT_SH_SYSCTL_FILE:-/etc/sysctl.d/99-nft-sh-forward.conf}"
+TRANSLATE_DIR="${NFT_SH_TRANSLATE_DIR:-/etc/nft-sh}"
+TRANSLATE_DEPLOY="$TRANSLATE_DIR/deployment.conf"
+LIBEXEC_DIR="${NFT_SH_LIBEXEC_DIR:-/usr/local/libexec/nft-sh}"
+SYSTEMD_DIR="${NFT_SH_SYSTEMD_DIR:-/etc/systemd/system}"
+XL_ID="" XL4="" XL6=""
+ACTION_LOCK_FD=""
+ROLLBACK_CONTEXT_KEYS=(WHITELIST_FILE FORWARD_FILE WHITELIST_ENABLED_FILE NFT_TABLE
+    NFT_PERSIST_DIR NFT_PERSIST_FILE NFT_INCLUDE_LINE NFT_MAIN_CONF SYSCTL_FILE
+    TRANSLATE_DIR TRANSLATE_DEPLOY LIBEXEC_DIR SYSTEMD_DIR NFT_SH_LOCK_FILE
+    NFT_SH_XLATE_ID NFT_SH_XLATE_V4 NFT_SH_XLATE_V6)
 
 # 旧版本脚本用过的表，应用规则时一并删除；其他程序和用户自己的表（如 inet filter）不会被改动
 LEGACY_TABLES=(whitelist_filter port_forward unified_filter unified_nat)
@@ -50,6 +60,7 @@ SNAPSHOT_DIR=""     # 本次操作开始前的快照（失败时恢复配置、�
 ROLLBACK_PENDING=0  # 已安排后台回滚任务，快照目录由它负责清理
 CONFIRM_ALWAYS=0    # 本次应用一定要求确认（重新应用规则 / 导入配置）
 FWD_LS="" FWD_LE="" FWD_TIP="" FWD_TS="" FWD_TE=""   # fwd_validate 的校验结果
+FWD_FAMILY="ipv4"
 
 # ============================================================================
 # 通用工具
@@ -278,11 +289,23 @@ ip_in_cidr() {
     [ $(( a & mask )) -eq $(( b & mask )) ]
 }
 
-# 转发目标：只允许普通 IPv4 单播地址
+# 转发目标：IPv4 单播或全局/ULA IPv6 字面量；不允许回环、链路本地和映射地址。
 validate_target_ip() {
-    local ip="$1" first
+    local ip="$1" first normalized
+    if [[ "$ip" == *:* ]]; then
+        [[ "$ip" != *'/'* && "$ip" != *'%'* && "$ip" != *'['* && "$ip" != *']'* ]] || return 1
+        normalized=$(normalize_ip_entry "$ip") || return 1
+        first="${normalized%%:*}"
+        [[ "$first" =~ ^[0-9a-f]+$ ]] || return 1
+        # 2000::/3 (including documentation addresses for isolated tests), fc00::/7.
+        if (( (16#$first & 0xe000) == 0x2000 || (16#$first & 0xfe00) == 0xfc00 )); then
+            return 0
+        fi
+        error "错误: IPv6 目标只支持全局单播和 ULA 地址"
+        return 1
+    fi
     if ! is_valid_ipv4 "$ip"; then
-        error "错误: 目标IP \"$ip\" 无效（只支持 IPv4 地址，不支持域名和 IPv6）"
+        error "错误: 目标IP \"$ip\" 无效（需要 IPv4 或 IPv6 字面量，不支持域名）"
         return 1
     fi
     first="${ip%%.*}"
@@ -434,29 +457,40 @@ whitelist_allows() {
 # 解析一行转发配置 "本地端口|目标IP|目标端口"（端口可以是 起始-结束）
 # 合法则输出 "本地起始 本地结束 目标IP 目标起始 目标结束"
 parse_forward_line() {
-    local line lp tip tp extra l t ls le ts te
+    local line lp tip tp extra l t ls le ts te family="" fields
     line=$(trim "$1")
     [ -z "$line" ] && return 1
     [[ "$line" == \#* ]] && return 1
-    [[ "$line" =~ ^[^\|]+\|[^\|]+\|[^\|]+$ ]] || return 1
-    IFS='|' read -r lp tip tp extra <<< "$line"
+    fields="${line//[^|]/}"
+    case "${#fields}" in
+        2) IFS='|' read -r lp tip tp extra <<< "$line" ;;
+        3) IFS='|' read -r family lp tip tp extra <<< "$line"
+           case "$family" in ipv4|ipv6) ;; *) return 1 ;; esac ;;
+        *) return 1 ;;
+    esac
+    [[ -n "$lp" && -n "$tip" && -n "$tp" ]] || return 1
     [ -z "$extra" ] || return 1
     tip=$(trim "$tip")
     validate_target_ip "$tip" >/dev/null || return 1
+    # A three-field legacy record always remains IPv4 -> IPv4.
+    if [[ -z "$family" && "$tip" == *:* ]]; then return 1; fi
+    tip=$(normalize_ip_entry "$tip") || return 1
     l=$(parse_port_spec "$lp") || return 1
     t=$(parse_port_spec "$tp") || return 1
     read -r ls le <<< "$l"
     read -r ts te <<< "$t"
     [ $((le - ls)) -eq $((te - ts)) ] || return 1
-    echo "$ls $le $tip $ts $te"
+    printf '%s %s %s %s %s%s\n' "$ls" "$le" "$tip" "$ts" "$te" "${family:+ $family}"
 }
 
-# 输出所有合法的转发条目，每行 "本地起始 本地结束 目标IP 目标起始 目标结束"
+# 输出所有合法条目：本地起始 本地结束 目标IP 目标起始 目标结束 入站族
 list_forwards() {
-    local file="${1:-$FORWARD_FILE}" line
+    local file="${1:-$FORWARD_FILE}" line parsed ls le tip ts te family
     [ -f "$file" ] || return 0
     while IFS= read -r line || [ -n "$line" ]; do
-        parse_forward_line "$line"
+        parsed=$(parse_forward_line "$line") || continue
+        read -r ls le tip ts te family <<< "$parsed"
+        printf '%s %s %s %s %s %s\n' "$ls" "$le" "$tip" "$ts" "$te" "${family:-ipv4}"
     done < "$file"
 }
 
@@ -474,14 +508,841 @@ invalid_forward_lines() {
 
 # 新的本地端口范围是否和已有转发重叠；重叠时输出已有的那条并返回 0
 forward_conflict() {
-    local s="$1" e="$2" ls le tip ts te
-    while read -r ls le tip ts te; do
+    local s="$1" e="$2" want="${3:-ipv4}" ls le tip ts te family
+    while read -r ls le tip ts te family; do
+        [ "$want" = "$family" ] || continue
         if [ "$s" -le "$le" ] && [ "$e" -ge "$ls" ]; then
             echo "本地 $(port_spec "$ls" "$le") → $tip:$(port_spec "$ts" "$te")"
             return 0
         fi
     done < <(list_forwards)
     return 1
+}
+
+# ============================================================================
+# Jool kernel translation. Control commands exit; no userspace data relay.
+# ============================================================================
+
+translation_settings() {
+    local file="${1:-$TRANSLATE_DEPLOY}" key value
+    local -A seen=()
+    if [ -d "$TRANSLATE_DIR" ] && [ ! -x "$TRANSLATE_DIR" ]; then
+        error '无法读取内核转换部署目录，请使用具备读取权限的用户预览' >&2; return 1
+    fi
+    if [ -e "$file" ] && [ ! -r "$file" ]; then error "无法读取 $file" >&2; return 1; fi
+    XL_ID="${NFT_SH_XLATE_ID:-nftsh}"
+    XL4="${NFT_SH_XLATE_V4:-198.18.241}"
+    XL6="${NFT_SH_XLATE_V6:-fd73:6866:7400}"
+    if [ -f "$file" ]; then
+        while IFS='=' read -r key value || [ -n "$key" ]; do
+            case "$key" in id|ipv4|ipv6|'') ;; *) return 1 ;; esac
+            if [ -n "$key" ]; then
+                [ -z "${seen[$key]:-}" ] || return 1
+                seen[$key]=1
+            fi
+            case "$key" in
+                id) XL_ID="$value" ;;
+                ipv4) XL4="$value" ;;
+                ipv6) XL6="$value" ;;
+                '') ;;
+                *) error "无效的内核转换部署参数: $key" >&2; return 1 ;;
+            esac
+        done < "$file"
+        [ "${#seen[@]}" -eq 3 ] || return 1
+    fi
+    [[ "$XL_ID" =~ ^[a-zA-Z][a-zA-Z0-9_]{0,7}$ ]] || return 1
+    is_valid_ipv4 "$XL4.1" || return 1
+    if ! ip_in_cidr "$XL4.1" 10.0.0.0/8 && ! ip_in_cidr "$XL4.1" 172.16.0.0/12 &&
+        ! ip_in_cidr "$XL4.1" 192.168.0.0/16 && ! ip_in_cidr "$XL4.1" 198.18.0.0/15; then return 1; fi
+    [[ "$XL6" =~ ^[fF][cCdD][0-9a-fA-F]{2}:[0-9a-fA-F]{1,4}:[0-9a-fA-F]{1,4}$ ]] || return 1
+    return 0
+}
+
+translation_needed() {
+    local ls le tip ts te family result=1
+    while read -r ls le tip ts te family; do
+        if [[ "$family" = ipv6 && "$tip" != *:* ]] || [[ "$family" = ipv4 && "$tip" == *:* ]]; then
+            result=0
+        fi
+    done < <(list_forwards "${1:-$FORWARD_FILE}")
+    return "$result"
+}
+
+translation_mode_needed() {
+    local ls le tip ts te family result=1
+    while read -r ls le tip ts te family; do
+        if { [ "$1" = 64 ] && [[ "$family" = ipv6 && "$tip" != *:* ]]; } ||
+            { [ "$1" = 46 ] && [[ "$family" = ipv4 && "$tip" == *:* ]]; }; then result=0; fi
+    done < <(list_forwards)
+    return "$result"
+}
+
+translation_synth6() {
+    local value
+    value=$(ipv4_to_int "$1") || return 1
+    printf '%s:64::%x:%x\n' "$XL6" "$((value >> 16))" "$((value & 65535))"
+}
+
+translation_alias6() { printf '%s:a46::%x\n' "$XL6" "$1"; }
+
+# Called only from build_ruleset; append to its dynamically scoped rule arrays.
+build_translation_rules() {
+    local idx="$1" mode link synth alias p rule_target source_check=""
+    translation_settings || { error '无效的内核转换部署配置' >&2; return 1; }
+    if [ "${f_family[idx]}" = ipv6 ]; then mode=64; else mode=46; fi
+    link="$XL_ID$mode"
+    if [ "$policy" = drop ]; then
+        if [ "$mode" = 64 ]; then source_check='ip6 saddr @allowed_ips_v6'; else source_check='ip saddr @allowed_ips'; fi
+    fi
+    if [ "$mode" = 64 ]; then
+        synth=$(translation_synth6 "${f_tip[idx]}") || return 1
+        for p in tcp udp; do
+            if [ "${f_ls[idx]}" -eq "${f_le[idx]}" ]; then rule_target="[$synth]:${f_ts[idx]}"
+            elif [ -n "${f_map[idx]}" ]; then rule_target="[$synth] : $p dport map @${f_map[idx]}"
+            else rule_target="$synth"; fi
+            pre+=("meta nfproto ipv6 fib daddr type local $p dport $lspec counter dnat ip6 to $rule_target $cmt")
+            outp+=("ip6 daddr != ::1 fib daddr type local $p dport $lspec counter dnat ip6 to $rule_target $cmt")
+            xguards+=("oifname \"$link\" ip6 daddr $synth $p dport $tspec ct status dnat ct original proto-dst $lspec $source_check counter accept")
+            xguards+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter accept")
+            # Two ingress ports may resolve to the same synthetic endpoint.
+            # Allocate distinct source endpoints before Jool, after the host's
+            # original-source whitelist check, so reply tuples cannot collapse.
+            xpost+=("oifname \"$link\" ct status dnat ip6 daddr $synth $p dport $tspec counter masquerade fully-random $cmt")
+            xpost+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter masquerade $cmt")
+        done
+    else
+        alias=$(translation_alias6 "${f_ls[idx]}")
+        for p in tcp udp; do
+            pre+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ip6 daddr $alias $p dport $tspec counter dnat ip6 to ${f_tip[idx]} $cmt")
+            pre+=("meta nfproto ipv4 fib daddr type local $p dport $lspec counter dnat ip to $XL4.128 $cmt")
+            outp+=("ip daddr != 127.0.0.0/8 fib daddr type local $p dport $lspec counter dnat ip to $XL4.128 $cmt")
+            xguards+=("oifname \"$link\" ip daddr $XL4.128 $p dport $lspec ct status dnat ct original proto-dst $lspec $source_check counter accept")
+            xguards+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ct status dnat ct original ip6 daddr $alias ip6 daddr ${f_tip[idx]} $p dport $tspec counter accept")
+            xpost+=("oifname \"$link\" fib saddr type local ct status dnat ip daddr $XL4.128 $p dport $lspec counter masquerade $cmt")
+            xpost+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ct status dnat ct original ip6 daddr $alias ip6 daddr ${f_tip[idx]} $p dport $tspec counter masquerade fully-random $cmt")
+        done
+    fi
+}
+
+translation_guards() {
+    local mode link
+    translation_needed || return 0
+    translation_settings || return 1
+    # These remain present even with no cross-family entries: stale internal
+    # routes cannot become an open gateway after deleting the final entry.
+    for mode in 64 46; do
+        link="$XL_ID$mode"
+        if translation_mode_needed "$mode"; then
+            if [ "$mode" = 64 ]; then
+                xguards+=("oifname \"$link\" ip6 daddr $XL6:64::/96 ct status dnat ct state established,related accept")
+                xguards+=("oifname \"$link\" ip daddr $XL4.64 ct state established,related accept")
+                xguards+=("iifname \"$link\" ip6 saddr $XL6:64::/96 ct state established,related accept")
+            else
+                xguards+=("oifname \"$link\" ip daddr $XL4.128 ct status dnat ct state established,related accept")
+                xguards+=("oifname \"$link\" ip6 daddr $XL6:46::/96 ct state established,related accept")
+                xguards+=("iifname \"$link\" ip saddr $XL4.128 ct state established,related accept")
+            fi
+        fi
+        xguards+=("iifname \"$link\" counter drop" "oifname \"$link\" counter drop")
+    done
+    xguards+=("ip daddr $XL4.0/24 counter drop" "ip6 daddr $XL6::/48 counter drop"
+        "ip saddr $XL4.0/24 counter drop" "ip6 saddr $XL6::/48 counter drop")
+    # Run after OUTPUT's DNAT reroute and postrouting SNAT, when oif is final.
+    output_guards+=("ip daddr $XL4.64 oifname != \"${XL_ID}64\" drop"
+        "ip daddr $XL4.128 oifname != \"${XL_ID}46\" drop"
+        "ip6 daddr $XL6:64::/96 oifname != \"${XL_ID}64\" drop"
+        "ip6 daddr $XL6:46::/96 oifname != \"${XL_ID}46\" drop")
+}
+
+translation_netns() {
+    local ns="$1"
+    shift
+    # The control tools need only the network namespace. ip -n / netns exec
+    # also remount /sys, which SELinux initrc_t correctly refuses on RHEL.
+    nsenter "--net=/run/netns/$ns" -- "$@"
+}
+
+translation_resource_owned() {
+    local mode="$1"
+    translation_netns "$XL_ID$mode" ip -d -o link show lo 2>/dev/null | grep -qF "alias nft.sh:$XL_ID:$mode"
+}
+
+translation_version_supported() {
+    [[ "$1" =~ ^4\.1\.([0-9]+)(\.[0-9]+)?$ ]] && [ "$((10#${BASH_REMATCH[1]}))" -ge 15 ]
+}
+
+jool_install_hint() {
+    printf '安装依赖: sudo bash %q install-jool\n' "$SCRIPT_PATH"
+    printf '只读诊断: bash %q check-jool\n' "$SCRIPT_PATH"
+}
+
+jool_loaded_version() {
+    cat "/sys/module/$1/version" 2>/dev/null
+}
+
+# Read-only: finding a module on disk does not prove the VPS permits loading it.
+check_jool() {
+    local tool value disk loaded module missing=0
+    for tool in ip ss nsenter jool modprobe modinfo; do
+        if ! command -v "$tool" >/dev/null; then
+            error "跨族转发缺少命令: $tool"
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ] || return 1
+    value=$(jool --version) || { error '无法运行 jool --version'; return 1; }
+    disk=$(modinfo -F version jool 2>/dev/null) || {
+        error "当前内核 $(uname -r) 没有可用 Jool 模块，需要匹配的 headers 和 DKMS 构建"; return 1;
+    }
+    translation_version_supported "$value" && [ "$value" = "$disk" ] || {
+        error "需要 Jool 4.1.15 或更新的 4.1 版本且工具与模块一致（工具: $value；磁盘模块: $disk）"; return 1;
+    }
+    for module in jool_common jool jool_siit; do
+        loaded=$(jool_loaded_version "$module") || continue
+        if [ "$value" != "$loaded" ]; then
+            error "已加载的 $module 版本 $loaded 与工具 $value 不同，请在维护时升级模块"; return 1
+        fi
+    done
+    modprobe -n jool >/dev/null 2>&1 || {
+        error "当前内核 $(uname -r) 的 Jool 模块或依赖不可用，请检查 modprobe -n -v jool"; return 1;
+    }
+    info "Jool 工具 / 当前内核磁盘模块: $value / $disk"
+    if loaded=$(jool_loaded_version jool); then
+        info "已加载 Jool 模块: $loaded"
+    else
+        warn 'Jool 模块尚未加载；只读检查未验证模块加载权限，install-jool 会实际加载验证'
+    fi
+}
+
+jool_os_id() {
+    sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '\042\047'
+}
+
+jool_install_platform() {
+    local id
+    id=$(jool_os_id)
+    case "$id" in
+        debian|ubuntu) echo debian ;;
+        rocky|almalinux|rhel|centos|fedora) echo rhel ;;
+        *) error "暂不自动安装此系统 ($id) 的 Jool，请按 https://www.jool.mx/en/install.html 安装" >&2; return 1 ;;
+    esac
+}
+
+jool_kernel_headers_ready() {
+    local build="${2:-/lib/modules/$1/build}" release
+    [ -f "$build/Makefile" ] && [ -r "$build/include/generated/utsrelease.h" ] || return 1
+    # Debian 11/12's kernel.release can contain the upstream source version;
+    # UTS_RELEASE is the ABI string used by the running kernel and vermagic.
+    release=$(awk -F '\042' '/^#define UTS_RELEASE / { print $2; exit }' "$build/include/generated/utsrelease.h")
+    [ "$release" = "$1" ]
+}
+
+jool_apt_candidate() {
+    local candidate
+    candidate=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/^[[:space:]]*Candidate:/ { print $2; exit }')
+    [ -n "$candidate" ] && [ "$candidate" != '(none)' ] || return 1
+    printf '%s\n' "$candidate"
+}
+
+# Debian 11/12/13 keep the same architecture/flavour metapackage names.
+# Do not infer a replacement for vendor kernels such as aws, ovh or xanmod.
+jool_debian_kernel_flavour() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+|\+deb(11|12|13))-(cloud-amd64|cloud-arm64|rt-amd64|rt-arm64|amd64|arm64)$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[3]}"
+}
+
+jool_debian_kernel_advice() {
+    local kernel="$1" flavour image headers
+    if [ "$(jool_os_id)" != debian ]; then
+        warn "请为当前内核 $kernel 配置匹配的 headers 软件源，或自行安排内核升级和重启后重试"
+        return
+    fi
+    flavour=$(jool_debian_kernel_flavour "$kernel") || {
+        warn "未识别的内核类型 $kernel，请使用内核提供方的匹配 headers；未建议替换成其他类型内核"; return;
+    }
+    image=$(jool_apt_candidate "linux-image-$flavour") &&
+        headers=$(jool_apt_candidate "linux-headers-$flavour") || {
+        warn "本机 APT 索引中缺少 linux-image-$flavour / linux-headers-$flavour，请先检查本 Debian 版本的软件源"; return;
+    }
+    warn "当前内核 $kernel 的 headers 不可用；可安装同类型内核与 headers 元包，再安排重启"
+    printf 'APT 候选版本: linux-image-%s=%s；linux-headers-%s=%s\n' "$flavour" "$image" "$flavour" "$headers"
+    printf '  sudo apt-get install --no-install-recommends --no-remove linux-image-%s linux-headers-%s\n' "$flavour" "$flavour"
+    echo '  sudo reboot'
+    printf '重新连接后先用 uname -r 确认已经进入新内核，再运行 sudo bash %q install-jool\n' "$SCRIPT_PATH"
+    warn '仅安装新版 headers 不能用于当前旧内核；若重启后内核未变，请检查 VPS 启动内核设置'
+}
+
+jool_kernel_diagnostics() {
+    local kernel
+    kernel=$(uname -r)
+    printf '系统: %s；内核: %s；架构: %s\n' "$(jool_os_id)" "$kernel" "$(uname -m)"
+    if jool_kernel_headers_ready "$kernel"; then
+        info '当前运行内核的 headers 已就绪'
+    elif [ "$(jool_os_id)" = debian ] && command -v apt-cache >/dev/null &&
+        ! jool_apt_candidate "linux-headers-$kernel" >/dev/null; then
+        jool_debian_kernel_advice "$kernel"
+    else
+        warn "未找到当前内核 $kernel 的完整 headers，安装器将尝试从软件源安装"
+    fi
+}
+
+jool_install_dependencies() {
+    local platform="$1" kernel="$2" need_module="${3:-1}"
+    local -a header_packages=()
+    case "$platform" in
+        debian)
+            apt-get update || { error '刷新 APT 索引失败，请检查软件源与网络后重试'; return 1; }
+            if [ "$need_module" -eq 1 ]; then
+                if jool_kernel_headers_ready "$kernel"; then
+                    info "复用已安装的匹配 headers: $kernel"
+                elif jool_apt_candidate "linux-headers-$kernel" >/dev/null; then
+                    header_packages+=("linux-headers-$kernel")
+                else
+                    error "软件源中没有当前运行内核的 linux-headers-$kernel，尚未安装构建依赖"
+                    jool_debian_kernel_advice "$kernel"
+                    return 1
+                fi
+            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-remove -y \
+                build-essential pkg-config libnl-genl-3-dev dkms "${header_packages[@]}" \
+                curl ca-certificates iproute2 util-linux kmod || {
+                error '构建依赖安装失败，请检查上面的 APT 错误后重试'; return 1;
+            }
+            ;;
+        rhel)
+            dnf install -y gcc make pkgconf-pkg-config libnl3-devel dkms "kernel-devel-$kernel" \
+                elfutils-libelf-devel curl ca-certificates iproute util-linux kmod || {
+                error "构建依赖安装失败；请确认已配置提供 dkms 的仓库（如 EPEL）和 kernel-devel-$kernel 后重试"; return 1;
+            }
+            ;;
+        *) return 1 ;;
+    esac
+    [ "$need_module" -eq 0 ] || jool_kernel_headers_ready "$kernel" || {
+        error "缺少当前内核 $kernel 的构建目录；请安装匹配的 headers/devel 后重试"; return 1;
+    }
+}
+
+# Explicit installation only, outside firewall transactions and boot restoration.
+# Build the pinned upstream source to avoid distribution packages starting their
+# generic Jool services. DKMS retains the source for future kernel rebuilds.
+install_jool() (
+    local platform kernel work="" fd tool value module build_tools=1 build_module=1
+    local expected=4.1.15.0 base=https://github.com/NICMx/Jool/releases/download/v4.1.15
+    [ "$EUID" -eq 0 ] || { error '安装 Jool 需要 root，请使用 sudo bash nft.sh install-jool'; return 1; }
+    if check_jool >/dev/null 2>&1; then
+        modprobe jool || { error '模块加载失败，请检查 VPS 模块权限、内核签名或 Secure Boot 设置'; return 1; }
+        check_jool
+        return $?
+    fi
+    platform=$(jool_install_platform) || return 1
+    kernel=$(uname -r)
+    # Never replace an existing translator, unload modules, or mix source and
+    # package versions. Matching partial installs can be completed safely.
+    if command -v jool >/dev/null; then
+        value=$(jool --version) || return 1
+        [ "$value" = "$expected" ] || {
+            error "已有 Jool 工具 $value；自动安装不会覆盖其他版本，请先在维护时升级到匹配版本"; return 1;
+        }
+        build_tools=0
+    fi
+    if command -v modinfo >/dev/null && value=$(modinfo -F version jool 2>/dev/null); then
+        [ "$value" = "$expected" ] || {
+            error "当前内核已有 Jool 磁盘模块 $value；请先在维护时升级，自动安装不会覆盖它"; return 1;
+        }
+        build_module=0
+    fi
+    for module in jool_common jool jool_siit; do
+        if value=$(jool_loaded_version "$module"); then
+            [ "$value" = "$expected" ] || {
+                error "已加载的 $module 是 $value；请在维护时升级，自动安装不会卸载在用模块"; return 1;
+            }
+        fi
+    done
+    command -v flock >/dev/null || { error '安装需要 util-linux 的 flock'; return 1; }
+    exec {fd}<> /run/lock/nft-sh-jool-install.lock || return 1
+    flock -n "$fd" || { error '另一项 Jool 安装正在进行，请稍后重试'; return 1; }
+    info "安装 Jool 4.1.15，当前内核: $kernel（编译可能需要几分钟）"
+    jool_install_dependencies "$platform" "$kernel" "$build_module" || return 1
+    for tool in curl sha256sum tar make dkms modprobe modinfo ldconfig; do
+        command -v "$tool" >/dev/null || { error "依赖安装后仍缺少 $tool"; return 1; }
+    done
+    if [ "$build_tools" -eq 1 ] || [ "$build_module" -eq 1 ]; then
+        work=$(mktemp -d "${TMPDIR:-/tmp}/nft-sh-jool.XXXXXXXX") || return 1
+        trap 'rm -rf -- "$work"' EXIT
+        curl --proto '=https' --tlsv1.2 -fL --retry 3 --connect-timeout 15 \
+            "$base/jool-4.1.15.tar.gz" -o "$work/jool.tar.gz" || {
+            error '下载 Jool 官方源码失败，请检查到 GitHub 的网络后重试'; return 1;
+        }
+        printf '%s  %s\n' 51604bcf6a9f7fbb9080876102d05da01dc91d8c73cd5828fd73d5895643f8cd "$work/jool.tar.gz" | sha256sum -c - || {
+            error 'Jool 源码 SHA256 不匹配，已停止安装'; return 1;
+        }
+        tar -xzf "$work/jool.tar.gz" -C "$work" || return 1
+        if [ "$build_tools" -eq 1 ]; then
+            (cd "$work/jool-4.1.15" && ./configure --prefix=/usr/local --with-xtables=no --with-bash-completion-dir=no && make -j2) || {
+                error 'Jool 工具编译失败，尚未安装工具'; return 1;
+            }
+        fi
+        if [ "$build_module" -eq 1 ]; then
+            if [ -n "$(dkms status -m jool -v 4.1.15)" ]; then
+                dkms install -m jool -v 4.1.15 -k "$kernel"
+            else
+                dkms install "$work/jool-4.1.15" -k "$kernel"
+            fi || { error 'Jool DKMS 构建失败，请查看 /var/lib/dkms/jool/4.1.15/ 下的 make.log'; return 1; }
+        fi
+        if [ "$build_tools" -eq 1 ]; then
+            make -C "$work/jool-4.1.15" install && ldconfig && hash -r || return 1
+        fi
+    fi
+    modprobe jool || {
+        error 'Jool 已安装但加载失败：请检查 VPS 模块权限、签名及 dmesg；脚本不会关闭 Secure Boot 或更换内核'; return 1;
+    }
+    check_jool || return 1
+    info 'Jool 依赖已就绪。请重新执行之前的转发操作；安装命令不会应用防火墙规则。'
+)
+
+translation_precheck() {
+    local mode route prefix other value ls le tip ts te family af
+    translation_settings "$TRANSLATE_DEPLOY" || { error '错误: 内核转换部署配置无效'; return 1; }
+    if [ -L "$SYSTEMD_DIR/nft-sh-translate.service" ] || [ -L "$LIBEXEC_DIR/nft.sh" ]; then
+        error '受管服务或脚本路径为符号链接，已拒绝覆盖'; return 1
+    fi
+    if [ -f "$SYSTEMD_DIR/nft-sh-translate.service" ] &&
+        ! grep -qF '# Managed by nft.sh: kernel translation' "$SYSTEMD_DIR/nft-sh-translate.service"; then
+        error '同名 systemd 单元不属于本项目，已拒绝覆盖'; return 1
+    fi
+    if [ -f "$LIBEXEC_DIR/nft.sh" ] && ! grep -qF '# NFTables 白名单防火墙' "$LIBEXEC_DIR/nft.sh"; then
+        error '同名恢复脚本不属于本项目，已拒绝覆盖'; return 1
+    fi
+    if [ -f "$TRANSLATE_DIR/live.deployment" ] &&
+        ! cmp -s <(printf 'id=%s\nipv4=%s\nipv6=%s\n' "$XL_ID" "$XL4" "$XL6") "$TRANSLATE_DIR/live.deployment"; then
+        error '转换资源仍在使用旧部署参数；请先删除跨族规则，再修改部署参数'
+        return 1
+    fi
+    check_jool || { jool_install_hint; return 1; }
+    for mode in 64 46; do
+        if ip netns list | awk '{print $1}' | grep -qxF "$XL_ID$mode"; then
+            translation_resource_owned "$mode" || { error "namespace $XL_ID$mode 不属于本项目"; return 1; }
+        fi
+        if ip link show "$XL_ID$mode" >/dev/null 2>&1; then
+            ip -d -o link show "$XL_ID$mode" | grep -qF "alias nft.sh:$XL_ID:$mode" || {
+                error "接口 $XL_ID$mode 不属于本项目"; return 1;
+            }
+        fi
+    done
+    while read -r ls le tip ts te family; do
+        af=4; [[ "$tip" != *:* ]] || af=6
+        if { [ "$af" = 4 ] && ip_in_cidr "$tip" "$XL4.0/24"; } ||
+            { [ "$af" = 6 ] && ip_in_cidr "$tip" "$XL6::/48"; }; then
+            error "目标 $tip 落入本项目内部转换网段，已拒绝"; return 1
+        fi
+        if [[ "$family" = ipv6 && "$af" = 4 ]] || [[ "$family" = ipv4 && "$af" = 6 ]]; then
+            route=$(ip "-$af" route get "$tip" 2>/dev/null) || { error "目标 $tip 没有可用路由"; return 1; }
+            [[ "$route" != local\ * ]] || { error "跨族目标必须是其他主机的可达地址: $tip"; return 1; }
+        fi
+    done < <(list_forwards)
+    # Ignore our own connected/return routes; reject overlapping external routes.
+    for other in 4 6; do
+        while IFS= read -r route; do
+            [[ " $route " != *" dev ${XL_ID}64 "* && " $route " != *" dev ${XL_ID}46 "* ]] || continue
+            read -r prefix value _ <<< "$route"
+            case "$prefix" in default) continue ;; local|broadcast|unreachable|blackhole|throw) prefix="$value" ;; esac
+            prefix=$(normalize_ip_entry "$prefix" 2>/dev/null) || continue
+            [[ "$prefix" != */0 ]] || continue
+            if [ "$other" = 4 ]; then value="$XL4.0/24"; else value="$XL6::/48"; fi
+            if ip_in_cidr "${value%%/*}" "$prefix" || ip_in_cidr "${prefix%%/*}" "$value"; then
+                error "转换网段 $value 与已有路由 $prefix 冲突，请更换部署参数"; return 1
+            fi
+        done < <(ip "-$other" route show table all)
+    done
+}
+
+translation_remove() {
+    local mode rc=0
+    local XL_ID XL4 XL6
+    if [ -f "$TRANSLATE_DIR/live.deployment" ]; then
+        translation_settings "$TRANSLATE_DIR/live.deployment" || return 1
+    else translation_settings || return 1; fi
+    command -v ip >/dev/null || return 0
+    for mode in 64 46; do
+        # Cut the link while the namespace still has its bind mount. Deleting
+        # the namespace first races the kernel's asynchronous peer destruction.
+        if ip -d -o link show "$XL_ID$mode" 2>/dev/null | grep -qF "alias nft.sh:$XL_ID:$mode"; then
+            if ! ip link del "$XL_ID$mode" 2>/dev/null && ip link show "$XL_ID$mode" >/dev/null 2>&1; then rc=1; fi
+        fi
+        if translation_resource_owned "$mode"; then
+            if command -v jool >/dev/null; then
+                translation_netns "$XL_ID$mode" jool instance remove nft-sh >/dev/null 2>&1 || true
+            fi
+            ip netns del "$XL_ID$mode" || rc=1
+        fi
+    done
+    return "$rc"
+}
+
+translation_json() {
+    local mode="$1" proto ls le tip ts te family port comma="" pool alias port_range
+    if [ "$mode" = 64 ]; then pool="$XL4.64"; else pool="$XL4.128"; fi
+    printf '{"instance":"nft-sh","framework":"netfilter","global":{"pool6":"%s:%s::/96","address-dependent-filtering":%s,"drop-externally-initiated-tcp":false,"ss-enabled":false},"pool4":[' "$XL6" "$mode" "$([ "$mode" = 64 ] && echo true || echo false)"
+    for proto in TCP UDP ICMP; do
+        port_range=1-65535; [ "$proto" != ICMP ] || port_range=0-65535
+        printf '%s{"protocol":"%s","prefix":"%s/32","port range":"%s"}' "$comma" "$proto" "$pool" "$port_range"
+        comma=,
+    done
+    printf '],"bib":['
+    comma=""
+    if [ "$mode" = 46 ]; then
+        while read -r ls le tip ts te family; do
+            [[ "$family" = ipv4 && "$tip" == *:* ]] || continue
+            printf -v alias '%s:a46::%x' "$XL6" "$ls"
+            for ((port = ls; port <= le; port++)); do
+                for proto in TCP UDP; do
+                    printf '%s{"protocol":"%s","ipv4 address":"%s#%s","ipv6 address":"%s#%s"}' "$comma" "$proto" "$pool" "$port" "$alias" "$((ts + port - ls))"
+                    comma=,
+                done
+            done
+        done < <(list_forwards)
+    fi
+    printf ']}\n'
+}
+
+translation_setup() {
+    local mode ns link host4 peer4 host6 peer6 pool4 pool6 offset config sockets
+    translation_settings || return 1
+    translation_remove || return 1
+    translation_needed || return 0
+    modprobe jool || return 1
+    for mode in 64 46; do
+        translation_mode_needed "$mode" || continue
+        ns="$XL_ID$mode"; link="$ns"
+        if [ "$mode" = 64 ]; then offset=1; pool4="$XL4.64"; else offset=5; pool4="$XL4.128"; fi
+        host4="$XL4.$offset"; peer4="$XL4.$((offset + 1))"
+        host6="$XL6:$([ "$mode" = 64 ] && echo 1 || echo 2)::1"
+        peer6="${host6%1}2"; pool6="$XL6:$mode::/96"
+        ip netns add "$ns" && translation_netns "$ns" ip link set lo alias "nft.sh:$XL_ID:$mode" || return 1
+        ip link add "$link" type veth peer name peer && ip link set "$link" alias "nft.sh:$XL_ID:$mode" || return 1
+        ip link set peer netns "$ns" && sysctl -qw "net/ipv6/conf/$link/accept_dad=0" &&
+            translation_netns "$ns" sysctl -qw net/ipv6/conf/peer/accept_dad=0 && ip addr add "$host4/30" dev "$link" &&
+            ip -6 addr add "$host6/64" dev "$link" nodad && ip link set "$link" up || return 1
+        translation_netns "$ns" ip addr add "$peer4/30" dev peer && translation_netns "$ns" ip -6 addr add "$peer6/64" dev peer nodad &&
+            translation_netns "$ns" ip link set peer up && translation_netns "$ns" ip link set lo up || return 1
+        translation_netns "$ns" ip route add default via "$host4" && translation_netns "$ns" ip -6 route add default via "$host6" || return 1
+        translation_netns "$ns" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 || return 1
+        printf 'table inet untranslated_guard {\n chain forward { type filter hook forward priority filter; policy drop; }\n}\n' |
+            translation_netns "$ns" nft -f - || return 1
+        # Always create a fresh instance: Jool file updates ignore the bib tag.
+        config=$(mktemp) || return 1
+        # These private pool addresses are not assigned to interfaces, and this
+        # dedicated namespace has no TCP/UDP sockets. Acknowledge Jool 4.1.15's
+        # ephemeral-port overlap warning here, never in the host namespace.
+        sockets=$(translation_netns "$ns" ss -Han -t -u) || { rm -f "$config"; return 1; }
+        if [ -n "$sockets" ]; then
+            error "转换 namespace $ns 出现未预期的 TCP/UDP socket"; rm -f "$config"; return 1
+        fi
+        if ! translation_json "$mode" > "$config" || ! translation_netns "$ns" jool file handle "$config" --force; then
+            rm -f "$config"; return 1
+        fi
+        rm -f "$config"
+        ip route add "$pool4/32" via "$peer4" dev "$link" &&
+            ip -6 route add "$pool6" via "$peer6" dev "$link" || return 1
+    done
+}
+
+translation_guard_close() {
+    local rules old_id="" links
+    translation_settings || return 1
+    links="\"${XL_ID}64\", \"${XL_ID}46\""
+    if [ -f "$TRANSLATE_DIR/live.deployment" ]; then
+        old_id=$(translation_settings "$TRANSLATE_DIR/live.deployment" && printf '%s' "$XL_ID") || return 1
+        if [ "$old_id" != "$XL_ID" ]; then links+=", \"${old_id}64\", \"${old_id}46\""; fi
+    fi
+    if nft list table inet nft_sh_transition >/dev/null 2>&1; then
+        nft list table inet nft_sh_transition | grep -qF 'nft.sh transition guard' || return 1
+    fi
+    rules="add table inet nft_sh_transition
+delete table inet nft_sh_transition
+table inet nft_sh_transition {
+ comment \"nft.sh transition guard\"
+ chain forward { type filter hook forward priority -5; policy accept;
+ iifname { $links } drop
+ oifname { $links } drop
+ }
+}"
+    printf '%s\n' "$rules" | nft -f -
+}
+
+translation_guard_open() {
+    if nft list table inet nft_sh_transition 2>/dev/null | grep -qF 'nft.sh transition guard'; then
+        nft delete table inet nft_sh_transition || return 1
+    fi
+    return 0
+}
+
+managed_forwarding_sysctl() {
+    local key="$1"
+    case "$key" in
+        net/ipv4/ip_forward) return 0 ;;
+        net/ipv6/conf/*/*)
+            case "${key##*/}" in forwarding|force_forwarding|accept_ra|accept_redirects) return 0 ;; esac ;;
+        net/ipv4/conf/*/*)
+            case "${key##*/}" in
+                forwarding|accept_redirects|send_redirects|secure_redirects|accept_source_route|rp_filter|shared_media|route_localnet|accept_local|proxy_arp|proxy_arp_pvlan|bootp_relay|log_martians|arp_filter|arp_ignore|arp_announce|arp_accept|medium_id|src_valid_mark|promote_secondaries) return 0 ;;
+            esac ;;
+    esac
+    return 1
+}
+
+snapshot_sysctls() {
+    local file value
+    : > "$1/sysctls"
+    for file in /proc/sys/net/ipv4/ip_forward /proc/sys/net/ipv{4,6}/conf/*/*; do
+        [ -f "$file" ] || continue
+        managed_forwarding_sysctl "${file#/proc/sys/}" || continue
+        { IFS= read -r value < "$file"; } 2>/dev/null || continue
+        [[ "$value" =~ ^-?[0-9]+$ ]] || continue
+        printf '%s %s\n' "${file#/proc/sys/}" "$value" >> "$1/sysctls"
+    done
+}
+
+restore_sysctls() {
+    local key value current rc=0
+    [ -f "$1/sysctls" ] || return 0
+    while read -r key value; do
+        [[ "$key" == net/ipv4/* || "$key" == net/ipv6/* ]] || return 1
+        [[ "$key" != *..* && "$value" =~ ^-?[0-9]+$ ]] || return 1
+        # Older snapshots also recorded read-only/dynamic fields such as
+        # ifindex. Restore only forwarding-related configuration we manage.
+        managed_forwarding_sysctl "$key" || continue
+        [ -f "/proc/sys/$key" ] || continue
+        { IFS= read -r current < "/proc/sys/$key"; } 2>/dev/null || continue
+        [ "$current" = "$value" ] || sysctl -qw "$key=$value" || rc=1
+    done < "$1/sysctls"
+    return "$rc"
+}
+
+persist_forward_value() {
+    local key="$1" value="$2" tmp source=/dev/null
+    mkdir -p "$(dirname "$SYSCTL_FILE")" || return 1
+    [ ! -f "$SYSCTL_FILE" ] || source="$SYSCTL_FILE"
+    tmp=$(mktemp "$(dirname "$SYSCTL_FILE")/.nft-forward.XXXXXX") || return 1
+    if ! awk -v key="$key" -v value="$value" '{
+        split($0,a,"="); gsub(/[[:space:]]/,"",a[1]); if(a[1]!=key) print
+    } END { print key " = " value }' "$source" > "$tmp" || ! mv -f "$tmp" "$SYSCTL_FILE"; then
+        rm -f "$tmp"; return 1
+    fi
+}
+
+ensure_ipv6_forward() {
+    local iface key value
+    command -v ip >/dev/null || { error 'IPv6 转发需要 iproute2，以检查和保留上联 RA'; return 1; }
+    # Preserve RA on the actual uplinks before switching them to router mode.
+    while IFS= read -r iface; do
+        [ -n "$iface" ] || continue
+        [[ "$iface" != *'/'* && "$iface" != *..* ]] || return 1
+        key="net/ipv6/conf/$iface/accept_ra"
+        value=$(cat "/proc/sys/$key" 2>/dev/null)
+        if [ "$value" = 1 ] || [ "$value" = 2 ]; then
+            [ "$value" = 2 ] || sysctl -qw "$key=2" || return 1
+            persist_forward_value "$key" 2 || return 1
+        fi
+    done < <(ip -6 route show default 2>/dev/null | awk '{for(i=1;i<NF;i++)if($i=="dev")print $(i+1)}' | sort -u)
+    [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" = 1 ] || sysctl -qw net.ipv6.conf.all.forwarding=1 || return 1
+    persist_forward_value net.ipv6.conf.all.forwarding 1
+}
+
+ensure_runtime_forwarding() {
+    local ls le tip ts te family need4=0 need6=0
+    while read -r ls le tip ts te family; do
+        if [[ "$family" = ipv4 || "$tip" != *:* ]]; then need4=1; fi
+        if [[ "$family" = ipv6 || "$tip" == *:* ]]; then need6=1; fi
+    done < <(list_forwards)
+    if [ "$need4" = 1 ]; then
+        ensure_ip_forward || return 1
+        if ip_forward_enabled; then persist_forward_value net.ipv4.ip_forward 1 || return 1
+        elif translation_needed; then error '跨族转发需要启用 IPv4 forwarding，已取消应用'; return 1; fi
+    fi
+    if [ "$need6" = 1 ]; then ensure_ipv6_forward || { error '启用 IPv6 转发失败'; return 1; }; fi
+    return 0
+}
+
+translation_current() {
+    local mode proto live
+    [ -f "$TRANSLATE_DIR/live.forward" ] && cmp -s "$FORWARD_FILE" "$TRANSLATE_DIR/live.forward" || return 1
+    translation_settings || return 1
+    for mode in 64 46; do
+        translation_mode_needed "$mode" || continue
+        translation_resource_owned "$mode" || return 1
+        translation_netns "$XL_ID$mode" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE' || return 1
+        if [ "$mode" = 64 ]; then
+            ip -4 route show "$XL4.64/32" | grep -qF "dev $XL_ID$mode" || return 1
+        else
+            ip -4 route show "$XL4.128/32" | grep -qF "dev $XL_ID$mode" || return 1
+        fi
+        ip -6 route show "$XL6:$mode::/96" | grep -qF "dev $XL_ID$mode" || return 1
+        live=$(translation_pool_state "$mode") || return 1
+        [ -f "$TRANSLATE_DIR/live.pool$mode" ] && [ "$live" = "$(cat "$TRANSLATE_DIR/live.pool$mode")" ] || return 1
+        if [ "$mode" = 46 ]; then
+            for proto in tcp udp; do
+                live=$(set -o pipefail; translation_netns "$XL_ID$mode" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) || return 1
+                [ "$live" = "$(cat "$TRANSLATE_DIR/live.$proto" 2>/dev/null)" ] || return 1
+            done
+        fi
+    done
+}
+
+translation_pool_state() {
+    local proto
+    for proto in tcp udp icmp; do
+        printf '%s\n' "$proto"
+        translation_netns "$XL_ID$1" jool -i nft-sh pool4 display "--$proto" --csv --no-headers || return 1
+    done
+}
+
+translation_record() {
+    local proto mode
+    translation_settings || return 1
+    mkdir -p "$TRANSLATE_DIR" || return 1
+    chmod 700 "$TRANSLATE_DIR" || return 1
+    printf 'id=%s\nipv4=%s\nipv6=%s\n' "$XL_ID" "$XL4" "$XL6" > "$TRANSLATE_DEPLOY" || return 1
+    if [ "$TRANSLATE_DEPLOY" != "$TRANSLATE_DIR/live.deployment" ]; then
+        cp "$TRANSLATE_DEPLOY" "$TRANSLATE_DIR/live.deployment" || return 1
+    fi
+    if [ "$FORWARD_FILE" != "$TRANSLATE_DIR/live.forward" ]; then
+        cp "$FORWARD_FILE" "$TRANSLATE_DIR/live.forward" || return 1
+    fi
+    for mode in 64 46; do
+        if translation_mode_needed "$mode"; then
+            translation_pool_state "$mode" > "$TRANSLATE_DIR/live.pool$mode" || return 1
+        else rm -f "$TRANSLATE_DIR/live.pool$mode"; fi
+    done
+    if translation_mode_needed 46; then
+        for proto in tcp udp; do
+            (set -o pipefail; translation_netns "${XL_ID}46" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) > "$TRANSLATE_DIR/live.$proto" || return 1
+        done
+    else
+        rm -f "$TRANSLATE_DIR/live.tcp" "$TRANSLATE_DIR/live.udp"
+    fi
+}
+
+translation_persist() {
+    local key value path
+    # A test/network namespace must not install a service in the host's systemd.
+    [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] || return 0
+    command -v systemctl >/dev/null || { error '跨族开机恢复需要 systemd oneshot'; return 1; }
+    for path in "$LIBEXEC_DIR" "$SYSTEMD_DIR" "$TRANSLATE_DIR" "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE" "$NFT_PERSIST_DIR" "$SYSCTL_FILE"; do
+        [[ "$path" =~ ^/[a-zA-Z0-9_./-]+$ && "$path" != *..* ]] || { error '开机恢复路径含不支持的字符'; return 1; }
+    done
+    mkdir -p "$LIBEXEC_DIR" "$SYSTEMD_DIR" || return 1
+    if [ "$SCRIPT_PATH" != "$(readlink -f "$LIBEXEC_DIR/nft.sh" 2>/dev/null)" ]; then
+        cp "$SCRIPT_PATH" "$LIBEXEC_DIR/nft.sh" || return 1
+    fi
+    chmod 700 "$LIBEXEC_DIR/nft.sh" || return 1
+    : > "$TRANSLATE_DIR/service.env" || return 1
+    for key in WHITELIST_FILE FORWARD_FILE ENABLED_FILE PERSIST_DIR SYSCTL_FILE TRANSLATE_DIR LIBEXEC_DIR SYSTEMD_DIR; do
+        case "$key" in
+            ENABLED_FILE) value="$WHITELIST_ENABLED_FILE" ;;
+            PERSIST_DIR) value="$NFT_PERSIST_DIR" ;;
+            *) value="${!key}" ;;
+        esac
+        printf 'NFT_SH_%s=%s\n' "$key" "$value" >> "$TRANSLATE_DIR/service.env" || return 1
+    done
+    cat > "$SYSTEMD_DIR/nft-sh-translate.service" <<EOF
+# Managed by nft.sh: kernel translation, no userspace relay.
+[Unit]
+Description=nft.sh kernel IPv4/IPv6 translation
+After=nftables.service network-online.target
+Wants=network-online.target
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+EnvironmentFile=$TRANSLATE_DIR/service.env
+ExecStart=/bin/bash $LIBEXEC_DIR/nft.sh __translate_boot
+ExecStop=/bin/bash $LIBEXEC_DIR/nft.sh __translate_stop
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload && systemctl enable nft-sh-translate.service
+}
+
+translation_boot() {
+    [ "$EUID" -eq 0 ] || return 1
+    # Restore only the last confirmed generation, not un-applied file edits.
+    local FORWARD_FILE="$TRANSLATE_DIR/live.forward" TRANSLATE_DEPLOY="$TRANSLATE_DIR/live.deployment"
+    [ -f "$FORWARD_FILE" ] && [ -f "$TRANSLATE_DEPLOY" ] || return 1
+    translation_needed || return 0
+    if translation_current && nft_table_exists "$NFT_TABLE"; then return 0; fi
+    # Load this project's file only. Starting the system's nftables.service here
+    # could execute its flush-ruleset and erase Docker/other live tables.
+    translation_guard_close && translation_precheck &&
+        (set -o pipefail; cat "$NFT_PERSIST_FILE" | nft -f -) &&
+        translation_setup && translation_record && translation_guard_open
+}
+
+translation_status() {
+    local mode prefix
+    translation_needed || return 0
+    translation_settings || return 1
+    echo '跨族后端: Jool 内核转换（无常驻用户态中继）'
+    printf '  工具: %s；已加载模块: %s\n' "$(jool --version 2>/dev/null || echo 不可用)" "$(cat /sys/module/jool/version 2>/dev/null || echo 未加载)"
+    for mode in 64 46; do
+        translation_mode_needed "$mode" || continue
+        prefix="$XL_ID$mode"
+        if translation_resource_owned "$mode" && translation_netns "$prefix" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE'; then
+            echo "  $mode: $prefix 已启用，转换前缀 $XL6:$mode::/96"
+            if [ "$mode" = 64 ]; then echo "    动态 IPv4 池: $XL4.64"
+            else echo "    静态 IPv4 池: $XL4.128"; fi
+            translation_pool_state "$mode" 2>/dev/null
+            if [ "$mode" = 46 ]; then
+                translation_netns "$prefix" jool -i nft-sh bib display --tcp --numeric --csv 2>/dev/null
+                translation_netns "$prefix" jool -i nft-sh bib display --udp --numeric --csv 2>/dev/null
+            fi
+        else
+            echo "  $mode: $prefix 未就绪（模块、实例或权限异常）"
+        fi
+    done
+    translation_current || warn '声明与运行状态不一致，请检查后重新 apply'
+}
+
+print_plan() {
+    local mode offset pool
+    show_forwards
+    build_ruleset || return 1
+    if translation_needed; then
+        translation_settings || return 1
+        printf '\n# Jool deployment: %s, IPv4 %s.0/24, IPv6 %s::/48\n' "$XL_ID" "$XL4" "$XL6"
+        for mode in 64 46; do
+            translation_mode_needed "$mode" || continue
+            printf '# namespace %s%s; pool6 %s:%s::/96\n' "$XL_ID" "$mode" "$XL6" "$mode"
+            if [ "$mode" = 64 ]; then offset=1; pool=64; else offset=5; pool=128; fi
+            printf '# veth %s%s: host %s.%s/30 -> peer %s.%s/30\n' "$XL_ID" "$mode" "$XL4" "$offset" "$XL4" "$((offset + 1))"
+            printf '# veth IPv6: host %s:%s::1/64 -> peer %s:%s::2/64\n' "$XL6" "$([ "$mode" = 64 ] && echo 1 || echo 2)" "$XL6" "$([ "$mode" = 64 ] && echo 1 || echo 2)"
+            printf '# host routes: %s.%s/32 and %s:%s::/96 via the namespace peer\n' "$XL4" "$pool" "$XL6" "$mode"
+            translation_json "$mode" || return 1
+        done
+        echo '# Requires matching Jool >= 4.1.15 (4.1 series) tools/module, namespace/veth, both IP families and routes.'
+        echo '# sysctl: net.ipv4.ip_forward=1; net.ipv6.conf.all.forwarding=1 (host and namespaces).'
+        echo '# Uplink accept_ra=1 is changed to 2 and persisted before enabling IPv6 forwarding.'
+    fi
+}
+
+finish_action_guard() {
+    [ "$ROLLBACK_PENDING" = 1 ] && [ -d "$SNAPSHOT_DIR" ] || return 0
+    if mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null; then : > "$SNAPSHOT_DIR/confirmed"; fi
+    : > "$SNAPSHOT_DIR/completed"
+}
+
+translation_uninstall() {
+    translation_guard_close && translation_remove || return 1
+    if [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] && command -v systemctl >/dev/null; then
+        systemctl stop nft-sh-translate.service >/dev/null 2>&1 || true
+        systemctl disable nft-sh-translate.service >/dev/null 2>&1 || true
+    fi
+    rm -f "$TRANSLATE_DIR/live.forward" "$TRANSLATE_DIR/live.tcp" "$TRANSLATE_DIR/live.udp" \
+        "$TRANSLATE_DIR/live.pool64" "$TRANSLATE_DIR/live.pool46" \
+        "$TRANSLATE_DIR/live.deployment" "$TRANSLATE_DIR/service.env" "$SYSTEMD_DIR/nft-sh-translate.service"
+    if [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] && command -v systemctl >/dev/null; then
+        systemctl daemon-reload || return 1
+    fi
+    translation_guard_open
 }
 
 # ============================================================================
@@ -572,10 +1433,10 @@ emit_chain() {
 # 根据配置文件生成完整规则。文件可以重复加载：先删除旧的 unified 表再整体重建，
 # 整个文件由 nft -f 一次性原子执行
 build_ruleset() {
-    local e i proto lspec tspec target cmt line policy="accept"
+    local e i proto lspec tspec target cmt line policy="accept" family af addr_af host loopback
     local ls le tip ts te
-    local -a v4=() v6=() f_ls=() f_le=() f_tip=() f_ts=() f_te=() f_map=()
-    local -a pre=() outp=() post=() in_rules=() fw_rules=()
+    local -a v4=() v6=() f_ls=() f_le=() f_tip=() f_ts=() f_te=() f_map=() f_family=()
+    local -a pre=() outp=() post=() xpost=() in_rules=() fw_rules=() xguards=() output_guards=()
 
     is_whitelist_enabled && policy="drop"
 
@@ -591,8 +1452,9 @@ build_ruleset() {
         echo -e "${YELLOW}警告: 转发配置 \"$line\" 格式无效，已跳过${NC}" >&2
     done < <(invalid_forward_lines)
 
-    while read -r ls le tip ts te; do
+    while read -r ls le tip ts te family; do
         f_ls+=("$ls"); f_le+=("$le"); f_tip+=("$tip"); f_ts+=("$ts"); f_te+=("$te")
+        f_family+=("$family")
     done < <(list_forwards)
 
     echo "#!/usr/sbin/nft -f"
@@ -607,6 +1469,7 @@ build_ruleset() {
     # （直接写 dnat to IP:起始-结束 只会从目标范围里挑一个端口，不是一一对应）
     for i in "${!f_ls[@]}"; do
         f_map[i]=""
+        if [[ "${f_family[i]}" = ipv4 && "${f_tip[i]}" == *:* ]]; then continue; fi
         if [ "${f_ls[i]}" -ne "${f_le[i]}" ] && [ "${f_ls[i]}" -ne "${f_ts[i]}" ]; then
             f_map[i]="fwd_ports_$((i + 1))"
             printf '\tmap %s {\n\t\ttype inet_service : inet_service\n\t\telements = {\n' "${f_map[i]}"
@@ -622,26 +1485,39 @@ build_ruleset() {
         lspec=$(port_spec "${f_ls[i]}" "${f_le[i]}")
         tspec=$(port_spec "${f_ts[i]}" "${f_te[i]}")
         cmt="comment \"nft.sh $lspec\""
+        family="${f_family[i]}"
+        af="ipv4"; [[ "${f_tip[i]}" != *:* ]] || af="ipv6"
+        if [ "$af" != "$family" ]; then
+            build_translation_rules "$i" || return 1
+            continue
+        fi
+        addr_af="ip"; host="${f_tip[i]}"; loopback="127.0.0.0/8"
+        if [ "$family" = "ipv6" ]; then addr_af="ip6"; host="[${f_tip[i]}]"; loopback="::1"; fi
         for proto in tcp udp; do
             if [ "${f_ls[i]}" -eq "${f_le[i]}" ]; then
-                target="${f_tip[i]}:${f_ts[i]}"
+                target="$host:${f_ts[i]}"
             elif [ -z "${f_map[i]}" ]; then
                 target="${f_tip[i]}"        # 端口段号码相同：不写端口，保持原端口
             else
-                target="${f_tip[i]} : $proto dport map @${f_map[i]}"
+                target="$host : $proto dport map @${f_map[i]}"
             fi
             # 只转发发往本机地址的流量，不会劫持容器 / VPN 客户端经过本机访问外网的流量
-            pre+=("meta nfproto ipv4 fib daddr type local $proto dport $lspec counter dnat ip to $target $cmt")
+            pre+=("meta nfproto $family fib daddr type local $proto dport $lspec counter dnat $addr_af to $target $cmt")
             # 本机访问自己的转发端口同样生效；本机访问其他服务器的同号端口不受影响
-            outp+=("ip daddr != 127.0.0.0/8 fib daddr type local $proto dport $lspec counter dnat ip to $target $cmt")
+            outp+=("$addr_af daddr != $loopback fib daddr type local $proto dport $lspec counter dnat $addr_af to $target $cmt")
             # 只对 DNAT 过的连接做 masquerade，保证目标服务器的回包经过本机
-            post+=("ct status dnat ip daddr ${f_tip[i]} $proto dport $tspec counter masquerade $cmt")
+            post+=("ct status dnat $addr_af daddr ${f_tip[i]} $proto dport $tspec counter masquerade $cmt")
         done
     done
 
+    translation_guards || return 1
     emit_chain prerouting "type nat hook prerouting priority dstnat; policy accept;" "${pre[@]}"
     emit_chain output_nat "type nat hook output priority -100; policy accept;" "${outp[@]}"
-    emit_chain postrouting "type nat hook postrouting priority srcnat; policy accept;" "${post[@]}"
+    # Specific translation SNAT must precede native rules for shared targets.
+    emit_chain postrouting "type nat hook postrouting priority srcnat; policy accept;" "${xpost[@]}" "${post[@]}"
+    if [ "${#output_guards[@]}" -gt 0 ]; then
+        emit_chain translation_route_guard "type filter hook postrouting priority 110; policy accept;" "${output_guards[@]}"
+    fi
 
     if [ "$policy" = "drop" ]; then
         in_rules=(
@@ -663,7 +1539,7 @@ build_ruleset() {
         )
     fi
     emit_chain input "type filter hook input priority filter; policy $policy;" "${in_rules[@]}"
-    emit_chain forward "type filter hook forward priority filter; policy accept;" "${fw_rules[@]}"
+    emit_chain forward "type filter hook forward priority filter; policy accept;" "${xguards[@]}" "${fw_rules[@]}"
     echo "}"
 }
 
@@ -679,14 +1555,38 @@ remove_snapshot_dir() {
 
 # 记录操作前的状态：三个配置文件 + 当前生效的 unified 表
 begin_action() {
-    local i=0 f t
+    local i=0 f t pending lockfile="${NFT_SH_LOCK_FILE:-$FORWARD_FILE.lock}"
     end_action
+    command -v flock >/dev/null || { error '需要 util-linux 的 flock 防止并发修改'; return 1; }
+    exec {ACTION_LOCK_FD}<> "$lockfile" || return 1
+    if ! flock -n "$ACTION_LOCK_FD"; then
+        error '另一项配置操作正在进行，请稍后重试'
+        exec {ACTION_LOCK_FD}>&-
+        ACTION_LOCK_FD=""
+        return 1
+    fi
+    # A disconnected foreground releases its descriptor before its independent
+    # guard runs. Keep the pending snapshot in the stable lock inode so a new
+    # transaction cannot be overwritten later by the older guard.
+    pending=$(head -n 1 "$lockfile")
+    case "$pending" in
+        */nft-sh.*)
+            if [ -d "$pending" ] && [ ! -e "$pending/completed" ]; then
+                error '前一次配置仍在等待确认或回滚，请稍后重试'
+                release_action_lock
+                return 1
+            fi ;;
+    esac
     CONFIRM_ALWAYS=0
     SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nft-sh.XXXXXX") || {
         SNAPSHOT_DIR=""
         return 1
     }
-    for f in "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE"; do
+    for f in "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE" "$SYSCTL_FILE" \
+        "$NFT_PERSIST_FILE" "$(detect_nft_main_conf)" "$TRANSLATE_DEPLOY" \
+        "$TRANSLATE_DIR/live.forward" "$TRANSLATE_DIR/live.tcp" "$TRANSLATE_DIR/live.udp" "$TRANSLATE_DIR/live.deployment" \
+        "$TRANSLATE_DIR/live.pool64" "$TRANSLATE_DIR/live.pool46" \
+        "$TRANSLATE_DIR/service.env" "$SYSTEMD_DIR/nft-sh-translate.service" "$LIBEXEC_DIR/nft.sh"; do
         i=$((i + 1))
         printf '%s\n' "$f" > "$SNAPSHOT_DIR/cfg.$i.path" || { end_action; return 1; }
         if [ -f "$f" ]; then
@@ -705,6 +1605,24 @@ begin_action() {
             fi
         done
     } > "$SNAPSHOT_DIR/live.nft"
+    snapshot_sysctls "$SNAPSHOT_DIR"
+    if [ -f "$TRANSLATE_DIR/live.forward" ]; then
+        translation_settings "$TRANSLATE_DIR/live.deployment" || return 1
+        if translation_resource_owned 64 || translation_resource_owned 46; then
+            : > "$SNAPSHOT_DIR/had_translation"
+            cp "$TRANSLATE_DIR/live.forward" "$SNAPSHOT_DIR/running.forward" || return 1
+        fi
+        translation_settings || return 1
+    fi
+    if [ "$(readlink /proc/self/ns/net 2>/dev/null)" = "$(readlink /proc/1/ns/net 2>/dev/null)" ] && command -v systemctl >/dev/null; then
+        systemctl is-enabled --quiet nft-sh-translate.service 2>/dev/null && : > "$SNAPSHOT_DIR/unit.enabled"
+        systemctl is-active --quiet nft-sh-translate.service 2>/dev/null && : > "$SNAPSHOT_DIR/unit.active"
+    fi
+    return 0
+}
+
+release_action_lock() {
+    if [ -n "${ACTION_LOCK_FD:-}" ]; then exec {ACTION_LOCK_FD}>&-; ACTION_LOCK_FD=""; fi
 }
 
 end_action() {
@@ -716,6 +1634,7 @@ end_action() {
     fi
     SNAPSHOT_DIR=""
     ROLLBACK_PENDING=0
+    release_action_lock
 }
 
 # 把配置文件恢复成快照里的内容
@@ -738,18 +1657,74 @@ restore_config_files() {
 # 恢复快照：实时规则 + 配置文件。旧规则恢复失败时删除本脚本的表，保证不会把人锁在外面
 restore_snapshot() {
     local snap="$1" rc=0
+    if [ -e "$snap/translation.changed" ]; then
+        translation_guard_close || rc=1
+        translation_remove || rc=1
+        if [ ! -e "$snap/unit.active" ] && [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ]; then
+            systemctl stop nft-sh-translate.service >/dev/null 2>&1 || true
+        fi
+    fi
+    restore_config_files "$snap" || rc=1
+    if [ -e "$snap/translation.changed" ] && [ -e "$snap/had_translation" ]; then
+        # The desired file might have been edited manually before apply. Rebuild
+        # the last running declaration, not that un-applied desired file.
+        local FORWARD_FILE="$snap/running.forward"
+        local TRANSLATE_DEPLOY="$TRANSLATE_DIR/live.deployment"
+        translation_setup || rc=1
+    fi
     # RHEL 的 SELinux 域可能禁止 nft 直接读取 user_tmp_t；由 shell 读取后经管道传入。
     if ! (set -o pipefail; cat "$snap/live.nft" | nft -f -) 2>/dev/null; then
         nft delete table inet "$NFT_TABLE" 2>/dev/null
         rc=1
     fi
-    restore_config_files "$snap" || rc=1
+    restore_sysctls "$snap" || rc=1
+    if [ -e "$snap/translation.changed" ]; then
+        if [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] && command -v systemctl >/dev/null; then
+            systemctl daemon-reload >/dev/null 2>&1 || rc=1
+            if [ -e "$snap/unit.enabled" ]; then
+                systemctl enable nft-sh-translate.service >/dev/null 2>&1 || rc=1
+            else
+                systemctl disable nft-sh-translate.service >/dev/null 2>&1 || true
+            fi
+        fi
+        if [ "$rc" -eq 0 ]; then translation_guard_open || rc=1; fi
+    fi
     return $rc
+}
+
+save_rollback_context() {
+    local key
+    for key in "${ROLLBACK_CONTEXT_KEYS[@]}"; do
+        printf '%s\0%s\0' "$key" "${!key-}" || return 1
+    done > "$1/context"
+}
+
+load_rollback_context() {
+    local key value
+    local -A values=()
+    [ -f "$1/context" ] || return 0
+    while IFS= read -r -d '' key; do
+        IFS= read -r -d '' value || return 1
+        case "$key" in
+            WHITELIST_FILE|FORWARD_FILE|WHITELIST_ENABLED_FILE|NFT_TABLE|NFT_PERSIST_DIR|NFT_PERSIST_FILE|NFT_INCLUDE_LINE|NFT_MAIN_CONF|SYSCTL_FILE|TRANSLATE_DIR|TRANSLATE_DEPLOY|LIBEXEC_DIR|SYSTEMD_DIR|NFT_SH_LOCK_FILE|NFT_SH_XLATE_ID|NFT_SH_XLATE_V4|NFT_SH_XLATE_V6) ;;
+            *) return 1 ;;
+        esac
+        [ -z "${values[$key]+present}" ] || return 1
+        values[$key]="$value"
+    done < "$1/context"
+    [ -z "$key" ] || return 1
+    [ "${#values[@]}" -eq "${#ROLLBACK_CONTEXT_KEYS[@]}" ] || return 1
+    for key in "${ROLLBACK_CONTEXT_KEYS[@]}"; do
+        printf -v "$key" '%s' "${values[$key]}" || return 1
+    done
 }
 
 # 在独立于当前 SSH 会话的后台安排回滚：即使连接断开、脚本被终止，也会按时回滚
 schedule_rollback_guard() {
     local snap="$1" delay="$2" self="$1/nft.sh"
+    # systemd-run does not inherit shell configuration. Store only known data
+    # fields, including first-deployment parameters not yet persisted to disk.
+    save_rollback_context "$snap" || return 1
     if [ ! -f "$SCRIPT_PATH" ] || ! cp -f "$SCRIPT_PATH" "$self" 2>/dev/null || [ ! -s "$self" ]; then
         return 1
     fi
@@ -762,7 +1737,10 @@ schedule_rollback_guard() {
         return 0
     fi
     if command -v setsid >/dev/null 2>&1; then
-        setsid /bin/bash "$self" __rollback_guard "$snap" "$delay" </dev/null >/dev/null 2>&1 &
+        (
+            [ -z "${ACTION_LOCK_FD:-}" ] || exec {ACTION_LOCK_FD}>&-
+            exec setsid /bin/bash "$self" __rollback_guard "$snap" "$delay"
+        ) </dev/null >/dev/null 2>&1 &
         return 0
     fi
     return 1
@@ -770,14 +1748,30 @@ schedule_rollback_guard() {
 
 # 后台回滚任务本体（由 schedule_rollback_guard 启动）
 rollback_guard() {
-    local snap="$1" delay="${2:-0}" message
+    local snap="$1" delay="${2:-0}" message i deadline now
     case "$snap" in
         */nft-sh.*) ;;
         *) return 1 ;;
     esac
     [ -d "$snap" ] || return 0
+    load_rollback_context "$snap" || return 1
     if [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ]; then
-        sleep "$delay"
+        for ((i = 0; i < delay; i++)); do
+            [ -d "$snap" ] || return 0
+            if [ -e "$snap/confirmed" ] && [ -e "$snap/completed" ]; then break; fi
+            sleep 1
+        done
+    fi
+    [ -d "$snap" ] || return 0
+    if [ -f "$snap/confirm.deadline" ]; then
+        deadline=$(cat "$snap/confirm.deadline")
+        if [[ "$deadline" =~ ^[0-9]+$ ]]; then
+            while [ -d "$snap" ] && [ ! -e "$snap/confirmed" ]; do
+                now=$(date +%s)
+                [ "$now" -lt "$deadline" ] || break
+                sleep 1
+            done
+        fi
     fi
     [ -d "$snap" ] || return 0
     # 和前台的确认 / 回滚互斥，避免临近超时时重复恢复或误报确认成功。
@@ -822,6 +1816,7 @@ needs_confirmation() {
 # 规则已生效后等待确认，超时或拒绝则回滚
 confirm_or_rollback() {
     local snap="$SNAPSHOT_DIR" ans="" answered=0
+    case "$snap" in */nft-sh.*) [ -d "$snap" ] || return 1 ;; *) return 1 ;; esac
     echo ""
     warn "规则已生效。请不要关闭当前窗口，另开一个 SSH 窗口测试能否正常登录。"
     echo -ne "${YELLOW}确认正常请在 ${ROLLBACK_TIMEOUT} 秒内输入 y 并回车，超时或输入其他内容将自动回滚: ${NC}"
@@ -952,10 +1947,14 @@ ip_forward_enabled() {
 
 # 对重新应用和导入的配置同样检查 SSH 端口和重复范围，不能只在添加时校验。
 precheck_forwards() {
-    local ls le tip ts te p i ports
-    local -a starts=() ends=()
+    local ls le tip ts te p i ports family
+    local -a starts=() ends=() families=()
+    if [ -n "$(invalid_forward_lines)" ]; then
+        error "错误: 转发配置含无效条目，已拒绝应用"
+        return 1
+    fi
     ports=$(get_ssh_ports)
-    while read -r ls le tip ts te; do
+    while read -r ls le tip ts te family; do
         for p in $ports; do
             if [ "$p" -ge "$ls" ] && [ "$p" -le "$le" ]; then
                 error "错误: 转发配置包含 SSH 端口 $p，已拒绝应用"
@@ -963,25 +1962,33 @@ precheck_forwards() {
             fi
         done
         for i in "${!starts[@]}"; do
+            [ "$family" = "${families[i]}" ] || continue
             if [ "$ls" -le "${ends[i]}" ] && [ "$le" -ge "${starts[i]}" ]; then
                 error "错误: 转发配置中的本地端口范围重叠: $(port_spec "$ls" "$le")"
                 return 1
             fi
         done
-        starts+=("$ls"); ends+=("$le")
+        starts+=("$ls"); ends+=("$le"); families+=("$family")
     done < <(list_forwards)
     return 0
 }
 
-# 应用完整规则（原子操作），成功后写入持久化配置
+# 应用完整 nft 规则，跨族资源按阶段保护，成功后写入持久化配置
 apply_all_rules() {
-    local rules live err wl_count fw_count confirm=0
+    local rules live err wl_count fw_count confirm=0 cross_change=0
+    case "$SNAPSHOT_DIR" in */nft-sh.*) [ -d "$SNAPSHOT_DIR" ] || return 1 ;; *) error '应用前必须建立有效快照'; return 1 ;; esac
     echo -e "${YELLOW}正在应用防火墙和转发规则...${NC}"
 
     if ! precheck_forwards || ! precheck_lockout; then
         [ -n "$SNAPSHOT_DIR" ] && restore_config_files "$SNAPSHOT_DIR"
         warn "已取消，配置和防火墙规则都没有改动"
         return 1
+    fi
+    if translation_needed; then
+        if ! translation_precheck; then restore_config_files "$SNAPSHOT_DIR"; return 1; fi
+        translation_current || cross_change=1
+    elif [ -f "$TRANSLATE_DIR/live.forward" ] && translation_needed "$TRANSLATE_DIR/live.forward"; then
+        cross_change=1
     fi
 
     rules=$(mktemp) || { restore_config_files "$SNAPSHOT_DIR"; return 1; }
@@ -991,9 +1998,15 @@ apply_all_rules() {
         restore_config_files "$SNAPSHOT_DIR"
         return 1
     fi
+    if ! err=$(nft -c -f "$live" 2>&1); then
+        error "规则预检失败: $err"
+        restore_config_files "$SNAPSHOT_DIR"
+        rm -f "$rules" "$live"
+        return 1
+    fi
 
     # 先安排独立的回滚任务，再加载规则；保护程序无法启动时不冒险应用。
-    if needs_confirmation; then
+    if needs_confirmation || [ "$cross_change" = 1 ]; then
         if ! schedule_rollback_guard "$SNAPSHOT_DIR" $((ROLLBACK_TIMEOUT + 5)); then
             error "无法创建后台回滚任务，已取消应用"
             restore_config_files "$SNAPSHOT_DIR"
@@ -1001,14 +2014,42 @@ apply_all_rules() {
             return 1
         fi
         ROLLBACK_PENDING=1
-        confirm=1
+        if ! printf '%s\n' "$SNAPSHOT_DIR" > "${NFT_SH_LOCK_FILE:-$FORWARD_FILE.lock}"; then
+            restore_config_files "$SNAPSHOT_DIR"
+            finish_action_guard
+            rm -f "$rules" "$live"
+            return 1
+        fi
+        if needs_confirmation; then confirm=1; fi
+    fi
+
+    if ! ensure_runtime_forwarding; then
+        restore_config_files "$SNAPSHOT_DIR"
+        restore_sysctls "$SNAPSHOT_DIR"
+        mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null && : > "$SNAPSHOT_DIR/confirmed"
+        : > "$SNAPSHOT_DIR/completed"
+        rm -f "$rules" "$live"
+        return 1
+    fi
+    if [ "$cross_change" = 1 ]; then
+        : > "$SNAPSHOT_DIR/translation.changed"
+        if ! translation_guard_close || ! translation_setup; then
+            error '内核转换准备失败，正在恢复旧配置和转换路径'
+            restore_snapshot "$SNAPSHOT_DIR"
+            mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null && : > "$SNAPSHOT_DIR/confirmed"
+            : > "$SNAPSHOT_DIR/completed"
+            rm -f "$rules" "$live"
+            return 1
+        fi
     fi
 
     if ! err=$(nft -f "$live" 2>&1); then
         error "✗ 规则应用失败，防火墙保持原样，没有做任何改动。nft 输出:"
         printf '%s\n' "$err" | head -n 20
         if [ -n "$SNAPSHOT_DIR" ]; then
-            restore_config_files "$SNAPSHOT_DIR"
+            if [ "$cross_change" = 1 ]; then restore_snapshot "$SNAPSHOT_DIR"; else
+                restore_config_files "$SNAPSHOT_DIR"; restore_sysctls "$SNAPSHOT_DIR"
+            fi
             if [ "$ROLLBACK_PENDING" -eq 1 ]; then
                 mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null && : > "$SNAPSHOT_DIR/confirmed"
                 : > "$SNAPSHOT_DIR/completed"
@@ -1019,16 +2060,45 @@ apply_all_rules() {
         return 1
     fi
 
+    if [ "$cross_change" = 1 ] && ! translation_guard_open; then
+        restore_snapshot "$SNAPSHOT_DIR"
+        finish_action_guard
+        rm -f "$rules" "$live"
+        return 1
+    fi
+    if [ "$ROLLBACK_PENDING" = 1 ]; then
+        printf '%s\n' "$(( $(date +%s) + ROLLBACK_TIMEOUT ))" > "$SNAPSHOT_DIR/confirm.deadline"
+    fi
+
     if [ "$confirm" -eq 1 ] && ! confirm_or_rollback; then
         rm -f "$rules" "$live"
         return 1
     fi
 
     if ! persist_rules "$rules"; then
+        if [ "$cross_change" = 1 ]; then restore_snapshot "$SNAPSHOT_DIR"; fi
         warn "规则已在内存中生效，但持久化失败，请修复文件路径或权限后重新 apply"
         rm -f "$rules" "$live"
-        [ "$ROLLBACK_PENDING" -ne 1 ] || : > "$SNAPSHOT_DIR/completed"
+        finish_action_guard
         return 1
+    fi
+    if translation_needed; then
+        if ! translation_record || ! translation_persist; then
+            error '内核转换持久化失败，恢复修改前的配置'
+            : > "$SNAPSHOT_DIR/translation.changed"
+            restore_snapshot "$SNAPSHOT_DIR"
+            finish_action_guard
+            rm -f "$rules" "$live"
+            return 1
+        fi
+    elif [ "$cross_change" = 1 ]; then
+        if ! translation_uninstall; then
+            restore_snapshot "$SNAPSHOT_DIR"; finish_action_guard
+            rm -f "$rules" "$live"; return 1
+        fi
+    fi
+    if [ "$ROLLBACK_PENDING" = 1 ] && [ "$confirm" = 0 ]; then
+        mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null && : > "$SNAPSHOT_DIR/confirmed"
     fi
     [ "$ROLLBACK_PENDING" -ne 1 ] || : > "$SNAPSHOT_DIR/completed"
     rm -f "$rules" "$live"
@@ -1040,7 +2110,8 @@ apply_all_rules() {
     else
         echo -e "${GREEN}✓ 规则已应用 - 白名单${RED}[关闭]${GREEN}，转发 ${fw_count} 条（TCP+UDP）${NC}"
     fi
-    if [ "$fw_count" -gt 0 ] && ! ip_forward_enabled; then
+    if [ "$fw_count" -gt 0 ] && ! ip_forward_enabled &&
+        list_forwards | awk '$6 == "ipv4" || index($3, ":") == 0 { needed=1 } END { exit !needed }'; then
         warn "注意: IPv4 转发 (net.ipv4.ip_forward) 未开启，端口转发不会生效，请在菜单中选择 7 开启"
     fi
     return 0
@@ -1191,11 +2262,11 @@ enable_ip_forward() {
         error "✗ 启用失败（部分容器类 VPS 不允许修改内核参数）"
         return 1
     fi
-    if mkdir -p "$(dirname "$SYSCTL_FILE")" &&
-        printf '# Written by nft.sh: port forwarding needs IPv4 forwarding\nnet.ipv4.ip_forward = 1\n' > "$SYSCTL_FILE"; then
+    if persist_forward_value net.ipv4.ip_forward 1; then
         info "✓ IPv4转发已启用，并写入 $SYSCTL_FILE（重启后仍然生效）"
     else
         warn "IPv4转发已临时启用，但写入 $SYSCTL_FILE 失败，重启后会失效"
+        return 1
     fi
     conflict=$(grep -lsE '^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=[[:space:]]*0' /etc/sysctl.conf /etc/sysctl.d/*.conf 2>/dev/null | grep -vxF "$SYSCTL_FILE" | tr '\n' ' ')
     if [ -n "$conflict" ]; then
@@ -1221,8 +2292,11 @@ ensure_ip_forward() {
 # 成功时结果保存在 FWD_LS FWD_LE FWD_TIP FWD_TS FWD_TE
 fwd_validate() {
     local l t conflict
+    FWD_FAMILY="${4:-ipv4}"
+    case "$FWD_FAMILY" in ipv4|ipv6) ;; *) error "错误: 入站地址族必须为 ipv4 或 ipv6"; return 1 ;; esac
     FWD_TIP=$(trim "$2")
     validate_target_ip "$FWD_TIP" || return 1
+    FWD_TIP=$(normalize_ip_entry "$FWD_TIP") || return 1
     if ! l=$(parse_port_spec "$1"); then
         error "错误: 无效的本地端口 \"$(trim "$1")\"（范围 1-65535；端口段写成 起始-结束，且起始小于结束）"
         return 1
@@ -1237,7 +2311,7 @@ fwd_validate() {
         error "错误: 端口数量必须相同（本地 $((FWD_LE - FWD_LS + 1)) 个 vs 目标 $((FWD_TE - FWD_TS + 1)) 个）"
         return 1
     fi
-    if conflict=$(forward_conflict "$FWD_LS" "$FWD_LE"); then
+    if conflict=$(forward_conflict "$FWD_LS" "$FWD_LE" "$FWD_FAMILY"); then
         error "错误: 本地端口与已有转发重叠: $conflict"
         return 1
     fi
@@ -1248,8 +2322,12 @@ fwd_append() {
     local lspec tspec
     lspec=$(port_spec "$FWD_LS" "$FWD_LE")
     tspec=$(port_spec "$FWD_TS" "$FWD_TE")
-    append_line "$FORWARD_FILE" "$lspec|$FWD_TIP|$tspec" || return 1
-    info "✓ 已添加转发: 本地 $lspec → $FWD_TIP:$tspec [TCP+UDP]"
+    if [[ "$FWD_FAMILY" = "ipv4" && "$FWD_TIP" != *:* ]]; then
+        append_line "$FORWARD_FILE" "$lspec|$FWD_TIP|$tspec" || return 1
+    else
+        append_line "$FORWARD_FILE" "$FWD_FAMILY|$lspec|$FWD_TIP|$tspec" || return 1
+    fi
+    info "✓ 已添加转发: $FWD_FAMILY 本地 $lspec → $FWD_TIP:$tspec [TCP+UDP]"
 }
 
 # 删除第 N 条（按 list_forwards 的顺序）转发，只改配置文件
@@ -1281,23 +2359,32 @@ fwd_remove_index() {
 
 # 按本地端口（段）查找转发的序号
 fwd_index_by_local() {
-    local want n=0 ls le
+    local want n=0 ls le tip ts te family found="" count=0
     want=$(parse_port_spec "$1") || return 1
-    while read -r ls le _; do
+    while read -r ls le tip ts te family; do
         n=$((n + 1))
+        [ -z "${2:-}" ] || [ "$family" = "$2" ] || continue
         if [ "$ls $le" = "$want" ]; then
-            echo "$n"
-            return 0
+            found="$n"; count=$((count + 1))
         fi
     done < <(list_forwards)
-    return 1
+    if [ "$count" -gt 1 ]; then
+        error "相同端口存在多个地址族，请指定 --listen-family ipv4|ipv6" >&2
+        return 1
+    fi
+    [ "$count" -eq 1 ] || return 1
+    echo "$found"
 }
 
 show_forwards() {
-    local n=0 ls le tip ts te
-    while read -r ls le tip ts te; do
+    local n=0 ls le tip ts te family backend target
+    while read -r ls le tip ts te family; do
         n=$((n + 1))
-        echo -e "${GREEN}[$n]${NC} [TCP+UDP] 本地:$(port_spec "$ls" "$le") → $tip:$(port_spec "$ts" "$te")"
+        target="$tip"; backend="nft"
+        [[ "$tip" != *:* ]] || target="[$tip]"
+        if { [[ "$tip" == *:* ]] && [ "$family" = "ipv4" ]; } ||
+            { [[ "$tip" != *:* ]] && [ "$family" = "ipv6" ]; }; then backend="Jool"; fi
+        echo -e "${GREEN}[$n]${NC} [TCP+UDP/$backend] $family 本地:$(port_spec "$ls" "$le") → $target:$(port_spec "$ts" "$te")"
     done < <(list_forwards)
     if [ "$n" -eq 0 ]; then
         warn "(无转发规则)"
@@ -1315,7 +2402,7 @@ fwd_confirm_and_apply() {
     echo -ne "确认? [Y/n]: "
     read -r confirm
     [[ "$confirm" =~ ^[Nn]$ ]] && return 0
-    if ! ensure_ip_forward || ! fwd_append; then
+    if ! fwd_append; then
         restore_config_files "$SNAPSHOT_DIR"
         return 1
     fi
@@ -1324,8 +2411,10 @@ fwd_confirm_and_apply() {
 
 # 添加单个端口转发
 add_forward_single() {
-    local target_ip target_port local_port
+    local target_ip target_port local_port family
     echo -e "\n${BLUE}【添加单端口转发】${NC}"
+    echo -ne "${YELLOW}入站地址族 [ipv4/ipv6，默认 ipv4]: ${NC}"
+    read -r family
     echo -ne "${YELLOW}目标IP: ${NC}"
     read -r target_ip
     echo -ne "${YELLOW}目标端口: ${NC}"
@@ -1336,14 +2425,16 @@ add_forward_single() {
         error "错误: 端口段请使用菜单 5（添加端口段转发）"
         return 1
     fi
-    fwd_validate "$local_port" "$target_ip" "$target_port" || return 1
+    fwd_validate "$local_port" "$target_ip" "$target_port" "${family:-ipv4}" || return 1
     fwd_confirm_and_apply
 }
 
 # 添加端口段转发
 add_forward_range() {
-    local target_ip ts te ls le
+    local target_ip ts te ls le family
     echo -e "\n${BLUE}【添加端口段转发】${NC}"
+    echo -ne "${YELLOW}入站地址族 [ipv4/ipv6，默认 ipv4]: ${NC}"
+    read -r family
     echo -ne "${YELLOW}目标IP: ${NC}"
     read -r target_ip
     echo -ne "${YELLOW}目标起始端口: ${NC}"
@@ -1354,7 +2445,7 @@ add_forward_range() {
     read -r ls
     echo -ne "${YELLOW}本地结束端口: ${NC}"
     read -r le
-    fwd_validate "$(trim "$ls")-$(trim "$le")" "$target_ip" "$(trim "$ts")-$(trim "$te")" || return 1
+    fwd_validate "$(trim "$ls")-$(trim "$le")" "$target_ip" "$(trim "$ts")-$(trim "$te")" "${family:-ipv4}" || return 1
     fwd_confirm_and_apply
 }
 
@@ -1384,7 +2475,7 @@ delete_forward() {
 # ============================================================================
 
 clear_all_rules() {
-    local clear_choice confirm batch
+    local clear_choice confirm batch translated=0
     echo -e "\n${BLUE}【清除规则】${NC}"
     echo -e "${GREEN}1.${NC} 清除所有白名单IP"
     echo -e "${GREEN}2.${NC} 清除所有转发端口"
@@ -1419,16 +2510,25 @@ clear_all_rules() {
             echo -ne "${RED}确认清除全部? [y/N]: ${NC}"
             read -r confirm
             [[ "$confirm" =~ ^[Yy]$ ]] || return 0
+            if translation_needed || [ -f "$TRANSLATE_DEPLOY" ]; then
+                translation_guard_close || return 1
+                translated=1
+            fi
             batch=$(
                 nft_table_exists "$NFT_TABLE" && echo "delete table inet $NFT_TABLE"
                 legacy_table_deletes
             )
             if [ -n "$batch" ] && ! nft_run_batch "$batch"; then
                 error "✗ 删除防火墙表失败，没有做任何改动"
+                [ "$translated" = 0 ] || translation_guard_open
                 return 1
             fi
             : > "$WHITELIST_FILE"
             : > "$FORWARD_FILE"
+            if [ "$translated" = 1 ]; then
+                translation_uninstall || return 1
+                rm -f "$TRANSLATE_DEPLOY" "$LIBEXEC_DIR/nft.sh"
+            fi
             if remove_include_line; then
                 rm -f "$NFT_PERSIST_FILE"
             else
@@ -1446,7 +2546,7 @@ export_config() {
     local backup f
     local -a members=()
     backup="$PWD/nftables_backup_$(date +%Y%m%d_%H%M%S).tar.gz"
-    for f in "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE"; do
+    for f in "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE" "$TRANSLATE_DEPLOY"; do
         [ -f "$f" ] && members+=("${f#/}")
     done
     if [ ${#members[@]} -eq 0 ]; then
@@ -1474,7 +2574,7 @@ read_backup_member() {
 # 导入配置：只读取本脚本的三个配置文件，内容逐条校验后再写入
 import_config() {
     local backup_file tmpd src total valid found=0 wl_ok=0 wl_bad=0 fw_ok=0 fw_bad=0
-    local ls le tip ts te flag name target
+    local ls le tip ts te family flag name target
     echo -ne "备份文件路径: "
     read -r backup_file
     backup_file=$(trim "$backup_file")
@@ -1496,8 +2596,12 @@ import_config() {
     src="$tmpd/forward"
     if read_backup_member "$backup_file" "${FORWARD_FILE#/}" "$src"; then
         found=1
-        list_forwards "$src" | while read -r ls le tip ts te; do
-            echo "$(port_spec "$ls" "$le")|$tip|$(port_spec "$ts" "$te")"
+        list_forwards "$src" | while read -r ls le tip ts te family; do
+            if [[ "$family" = "ipv4" && "$tip" != *:* ]]; then
+                echo "$(port_spec "$ls" "$le")|$tip|$(port_spec "$ts" "$te")"
+            else
+                echo "$family|$(port_spec "$ls" "$le")|$tip|$(port_spec "$ts" "$te")"
+            fi
         done > "$tmpd/forward.valid"
         fw_ok=$(list_forwards "$tmpd/forward.valid" | wc -l)
         fw_bad=$(invalid_forward_lines "$src" | wc -l)
@@ -1522,12 +2626,21 @@ import_config() {
         rm -rf "$tmpd"
         return 1
     fi
-    for name in whitelist forward enabled; do
+    src="$tmpd/deployment"
+    if read_backup_member "$backup_file" "${TRANSLATE_DEPLOY#/}" "$src"; then
+        if ! (translation_settings "$src"); then
+            error '备份中的内核转换部署参数无效，已取消导入'
+            rm -rf "$tmpd"; return 1
+        fi
+        cp "$src" "$tmpd/deployment.valid" || { rm -rf "$tmpd"; return 1; }
+    fi
+    for name in whitelist forward enabled deployment; do
         [ -f "$tmpd/$name.valid" ] || continue
         case "$name" in
             whitelist) target="$WHITELIST_FILE" ;;
             forward) target="$FORWARD_FILE" ;;
             enabled) target="$WHITELIST_ENABLED_FILE" ;;
+            deployment) target="$TRANSLATE_DEPLOY"; mkdir -p "$TRANSLATE_DIR" || { rm -rf "$tmpd"; return 1; } ;;
         esac
         if ! cat "$tmpd/$name.valid" > "$target"; then
             error "写入 $target 失败，已取消导入"
@@ -1581,6 +2694,12 @@ show_all_rules() {
     else
         echo -e "IPv4转发: ${RED}✗ 未启用${NC}"
     fi
+    if [ "$(cat /proc/sys/net/ipv6/conf/all/forwarding 2>/dev/null)" = 1 ]; then
+        echo -e "IPv6转发: ${GREEN}✓ 已启用${NC}"
+    else
+        echo -e "IPv6转发: ${RED}✗ 未启用${NC}"
+    fi
+    translation_status
     if nft_table_exists "$NFT_TABLE"; then
         echo -e "防火墙表: ${GREEN}✓ 已加载 (inet $NFT_TABLE)${NC}"
     else
@@ -1655,9 +2774,11 @@ main_menu() {
         echo -e "${GREEN}10.${NC} 清除所有规则"
         echo -e "${GREEN}11.${NC} 导出配置"
         echo -e "${GREEN}12.${NC} 导入配置"
+        echo -e "${GREEN}13.${NC} 安装跨族转发依赖(Jool)"
+        echo -e "${GREEN}14.${NC} 检查跨族转发依赖"
         echo -e "${GREEN}0.${NC} 退出"
         echo ""
-        echo -ne "选择 [0-12]: "
+        echo -ne "选择 [0-14]: "
         if ! read -r choice; then
             echo ""
             exit 0
@@ -1687,6 +2808,8 @@ main_menu() {
             10) clear_all_rules ;;
             11) export_config ;;
             12) import_config ;;
+            13) install_jool ;;
+            14) jool_kernel_diagnostics; check_jool || jool_install_hint ;;
             0) echo ""; exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -1752,11 +2875,14 @@ nft.sh $VERSION - nftables 白名单防火墙 + 端口转发管理脚本
   $me add-ip <IP/CIDR>                    添加白名单（如 1.2.3.4、1.2.3.0/24、2001:db8::/32）
   $me del-ip <IP/CIDR>                    删除白名单
   $me whitelist on|off                    启用 / 关闭白名单
-  $me add-forward <本地端口> <目标IP> <目标端口>
+  $me add-forward [--listen-family ipv4|ipv6] <本地端口> <目标IP> <目标端口>
                                           添加 TCP+UDP 转发，端口可以写成段，如 10000-10010
-  $me del-forward <本地端口>              删除转发（按本地端口或端口段）
+  $me del-forward [--listen-family ipv4|ipv6] <本地端口>
   $me ip-forward                          开启 IPv4 转发
+  $me install-jool                        安装并验证 Jool 依赖（不应用防火墙）
+  $me check-jool                          只读检查跨族工具、当前内核及模块版本
   $me print-rules                         只打印将要应用的 nftables 规则，不做任何修改
+  $me print-plan                          只读预览 nft、内核转换配置及环境要求
   $me help | version
 
 说明:
@@ -1766,7 +2892,7 @@ EOF
 }
 
 run_cli() {
-    local cmd="$1" rc=0 idx
+    local cmd="$1" rc=0 idx family=""
     shift
     CLI_MODE=1
     case "$cmd" in
@@ -1775,6 +2901,9 @@ run_cli() {
             ;;
         print-rules)
             build_ruleset
+            ;;
+        print-plan)
+            print_plan
             ;;
         apply)
             begin_action || return 1
@@ -1815,25 +2944,35 @@ run_cli() {
             esac
             ;;
         add-forward)
+            if [ "${1:-}" = "--listen-family" ]; then
+                [ $# -ge 2 ] || return 2
+                family="$2"; shift 2
+                case "$family" in ipv4|ipv6) ;; *) return 2 ;; esac
+            fi
             if [ $# -ne 3 ]; then
                 usage >&2
                 return 2
             fi
             begin_action || return 1
-            if fwd_validate "$1" "$2" "$3"; then
-                ensure_ip_forward && fwd_append && apply_all_rules
+            if fwd_validate "$1" "$2" "$3" "${family:-ipv4}"; then
+                fwd_append && apply_all_rules
                 rc=$?
             else
                 rc=1
             fi
             ;;
         del-forward)
+            if [ "${1:-}" = "--listen-family" ]; then
+                [ $# -ge 2 ] || return 2
+                family="$2"; shift 2
+                case "$family" in ipv4|ipv6) ;; *) return 2 ;; esac
+            fi
             if [ $# -ne 1 ]; then
                 usage >&2
                 return 2
             fi
             begin_action || return 1
-            if idx=$(fwd_index_by_local "$1"); then
+            if idx=$(fwd_index_by_local "$1" "$family"); then
                 fwd_remove_index "$idx" && apply_all_rules
                 rc=$?
             else
@@ -1860,6 +2999,15 @@ run_cli() {
 
 main() {
     case "${1:-}" in
+        __translate_boot)
+            translation_boot
+            exit $?
+            ;;
+        __translate_stop)
+            [ "$EUID" -eq 0 ] || exit 1
+            translation_guard_close && translation_remove
+            exit $?
+            ;;
         __rollback_guard)
             rollback_guard "${2:-}" "${3:-0}"
             exit $?
@@ -1872,11 +3020,23 @@ main() {
             echo "nft.sh $VERSION"
             exit 0
             ;;
+        check-jool)
+            [ $# -eq 1 ] || { usage >&2; exit 2; }
+            jool_kernel_diagnostics
+            check_jool && exit 0
+            jool_install_hint
+            exit 1
+            ;;
+        install-jool)
+            [ $# -eq 1 ] || { usage >&2; exit 2; }
+            install_jool
+            exit $?
+            ;;
     esac
 
     # 规则预览只读取已有配置，不要求 root/nft，也不初始化任何文件。
-    if [ "${1:-}" = "print-rules" ]; then
-        build_ruleset
+    if [ "${1:-}" = "print-rules" ] || [ "${1:-}" = "print-plan" ]; then
+        if [ "$1" = print-plan ]; then print_plan; else build_ruleset; fi
         exit $?
     fi
 

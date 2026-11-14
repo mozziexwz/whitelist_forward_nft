@@ -41,6 +41,9 @@ export NFT_SH_ENABLED_FILE="$WORK/enabled"
 export NFT_SH_PERSIST_DIR="$WORK/nftables.d"
 export NFT_SH_MAIN_CONF="$WORK/nftables.conf"
 export NFT_SH_SYSCTL_FILE="$WORK/sysctl.conf"
+export NFT_SH_TRANSLATE_DIR="$WORK/translate"
+export NFT_SH_LIBEXEC_DIR="$WORK/libexec"
+export NFT_SH_SYSTEMD_DIR="$WORK/systemd"
 export TMPDIR="$WORK"
 mkdir "$WORK/bin"
 REAL_SYSTEMCTL=$(command -v systemctl)
@@ -57,6 +60,7 @@ echo 1 > "$WHITELIST_ENABLED_FILE"
 apply_all_rules > "$WORK/baseline.log" 2>&1 || { cat "$WORK/baseline.log"; exit 1; }
 cp "$NFT_PERSIST_FILE" "$WORK/persist.before"
 nft -s list table inet unified > "$WORK/table.before"
+release_action_lock
 cat > "$WORK/driver.sh" <<'EOF'
 #!/bin/bash
 source "$1"
