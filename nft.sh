@@ -714,9 +714,13 @@ check_jool() {
     fi
 }
 
+jool_os_id() {
+    sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '\042\047'
+}
+
 jool_install_platform() {
     local id
-    id=$(sed -n 's/^ID=//p' /etc/os-release 2>/dev/null | tr -d '\042\047')
+    id=$(jool_os_id)
     case "$id" in
         debian|ubuntu) echo debian ;;
         rocky|almalinux|rhel|centos|fedora) echo rhel ;;
@@ -724,14 +728,82 @@ jool_install_platform() {
     esac
 }
 
+jool_kernel_headers_ready() {
+    local build="/lib/modules/$1/build"
+    [ -f "$build/Makefile" ] && [ -r "$build/include/config/kernel.release" ] &&
+        [ "$(cat "$build/include/config/kernel.release")" = "$1" ]
+}
+
+jool_apt_candidate() {
+    local candidate
+    candidate=$(LC_ALL=C apt-cache policy "$1" 2>/dev/null | awk '/^[[:space:]]*Candidate:/ { print $2; exit }')
+    [ -n "$candidate" ] && [ "$candidate" != '(none)' ] || return 1
+    printf '%s\n' "$candidate"
+}
+
+# Debian 11/12/13 keep the same architecture/flavour metapackage names.
+# Do not infer a replacement for vendor kernels such as aws, ovh or xanmod.
+jool_debian_kernel_flavour() {
+    [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9]+|\+deb(11|12|13))-(cloud-amd64|cloud-arm64|rt-amd64|rt-arm64|amd64|arm64)$ ]] || return 1
+    printf '%s\n' "${BASH_REMATCH[3]}"
+}
+
+jool_debian_kernel_advice() {
+    local kernel="$1" flavour image headers
+    if [ "$(jool_os_id)" != debian ]; then
+        warn "请为当前内核 $kernel 配置匹配的 headers 软件源，或自行安排内核升级和重启后重试"
+        return
+    fi
+    flavour=$(jool_debian_kernel_flavour "$kernel") || {
+        warn "未识别的内核类型 $kernel，请使用内核提供方的匹配 headers；未建议替换成其他类型内核"; return;
+    }
+    image=$(jool_apt_candidate "linux-image-$flavour") &&
+        headers=$(jool_apt_candidate "linux-headers-$flavour") || {
+        warn "本机 APT 索引中缺少 linux-image-$flavour / linux-headers-$flavour，请先检查本 Debian 版本的软件源"; return;
+    }
+    warn "当前内核 $kernel 的 headers 不可用；可安装同类型内核与 headers 元包，再安排重启"
+    printf 'APT 候选版本: linux-image-%s=%s；linux-headers-%s=%s\n' "$flavour" "$image" "$flavour" "$headers"
+    printf '  sudo apt-get install --no-install-recommends --no-remove linux-image-%s linux-headers-%s\n' "$flavour" "$flavour"
+    echo '  sudo reboot'
+    printf '重新连接后先用 uname -r 确认已经进入新内核，再运行 sudo bash %q install-jool\n' "$SCRIPT_PATH"
+    warn '仅安装新版 headers 不能用于当前旧内核；若重启后内核未变，请检查 VPS 启动内核设置'
+}
+
+jool_kernel_diagnostics() {
+    local kernel
+    kernel=$(uname -r)
+    printf '系统: %s；内核: %s；架构: %s\n' "$(jool_os_id)" "$kernel" "$(uname -m)"
+    if jool_kernel_headers_ready "$kernel"; then
+        info '当前运行内核的 headers 已就绪'
+    elif [ "$(jool_os_id)" = debian ] && command -v apt-cache >/dev/null &&
+        ! jool_apt_candidate "linux-headers-$kernel" >/dev/null; then
+        jool_debian_kernel_advice "$kernel"
+    else
+        warn "未找到当前内核 $kernel 的完整 headers，安装器将尝试从软件源安装"
+    fi
+}
+
 jool_install_dependencies() {
-    local platform="$1" kernel="$2"
+    local platform="$1" kernel="$2" need_module="${3:-1}"
+    local -a header_packages=()
     case "$platform" in
         debian)
-            apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-remove -y \
-                build-essential pkg-config libnl-genl-3-dev dkms "linux-headers-$kernel" \
+            apt-get update || { error '刷新 APT 索引失败，请检查软件源与网络后重试'; return 1; }
+            if [ "$need_module" -eq 1 ]; then
+                if jool_kernel_headers_ready "$kernel"; then
+                    info "复用已安装的匹配 headers: $kernel"
+                elif jool_apt_candidate "linux-headers-$kernel" >/dev/null; then
+                    header_packages+=("linux-headers-$kernel")
+                else
+                    error "软件源中没有当前运行内核的 linux-headers-$kernel，尚未安装构建依赖"
+                    jool_debian_kernel_advice "$kernel"
+                    return 1
+                fi
+            fi
+            DEBIAN_FRONTEND=noninteractive apt-get install --no-install-recommends --no-remove -y \
+                build-essential pkg-config libnl-genl-3-dev dkms "${header_packages[@]}" \
                 curl ca-certificates iproute2 util-linux kmod || {
-                error "构建依赖安装失败；请确认软件源提供当前内核的 linux-headers-$kernel 后重试"; return 1;
+                error '构建依赖安装失败，请检查上面的 APT 错误后重试'; return 1;
             }
             ;;
         rhel)
@@ -742,7 +814,7 @@ jool_install_dependencies() {
             ;;
         *) return 1 ;;
     esac
-    [ -f "/lib/modules/$kernel/build/Makefile" ] || {
+    [ "$need_module" -eq 0 ] || jool_kernel_headers_ready "$kernel" || {
         error "缺少当前内核 $kernel 的构建目录；请安装匹配的 headers/devel 后重试"; return 1;
     }
 }
@@ -787,7 +859,7 @@ install_jool() (
     exec {fd}<> /run/lock/nft-sh-jool-install.lock || return 1
     flock -n "$fd" || { error '另一项 Jool 安装正在进行，请稍后重试'; return 1; }
     info "安装 Jool 4.1.15，当前内核: $kernel（编译可能需要几分钟）"
-    jool_install_dependencies "$platform" "$kernel" || return 1
+    jool_install_dependencies "$platform" "$kernel" "$build_module" || return 1
     for tool in curl sha256sum tar make dkms modprobe modinfo ldconfig; do
         command -v "$tool" >/dev/null || { error "依赖安装后仍缺少 $tool"; return 1; }
     done
@@ -2734,7 +2806,7 @@ main_menu() {
             11) export_config ;;
             12) import_config ;;
             13) install_jool ;;
-            14) check_jool || jool_install_hint ;;
+            14) jool_kernel_diagnostics; check_jool || jool_install_hint ;;
             0) echo ""; exit 0 ;;
             *) error "无效选择" ;;
         esac
@@ -2947,7 +3019,7 @@ main() {
             ;;
         check-jool)
             [ $# -eq 1 ] || { usage >&2; exit 2; }
-            printf '内核: %s；架构: %s\n' "$(uname -r)" "$(uname -m)"
+            jool_kernel_diagnostics
             check_jool && exit 0
             jool_install_hint
             exit 1

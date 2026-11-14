@@ -97,6 +97,49 @@ for scenario in missing-client missing-module old mismatch loaded-mismatch unloa
     expect "read-only dependency diagnostic: $scenario" diagnostic "$scenario"
 done
 
+debian_headers() (
+    local scenario="$1" kernel=6.1.0-42-cloud-amd64 rc
+    CASE="$WORK/debian-$scenario"
+    mkdir "$CASE"
+    jool_os_id() { echo debian; }
+    jool_kernel_headers_ready() { [ -f "$CASE/headers-ready" ]; }
+    apt-cache() {
+        case "$2" in
+            linux-headers-6.1.0-42-cloud-amd64)
+                if [ "$scenario" = available ]; then echo '  Candidate: 6.1.159-1'; else echo '  Candidate: (none)'; fi ;;
+            linux-image-cloud-amd64|linux-headers-cloud-amd64) echo '  Candidate: 6.1.190-1' ;;
+        esac
+    }
+    apt-get() {
+        printf '%s\n' "$*" >> "$CASE/apt.calls"
+        [ "$scenario" != update-failed ] || return 1
+        [ "$1" != install ] || : > "$CASE/headers-ready"
+    }
+    [ "$scenario" != installed ] || : > "$CASE/headers-ready"
+    jool_install_dependencies debian "$kernel" "$([ "$scenario" = tools-only ] && echo 0 || echo 1)" > "$CASE/output" 2>&1
+    rc=$?
+    case "$scenario" in
+        installed|tools-only)
+            [ "$rc" -eq 0 ] && ! grep -q linux-headers- "$CASE/apt.calls" ;;
+        available) [ "$rc" -eq 0 ] && grep -q "linux-headers-$kernel" "$CASE/apt.calls" ;;
+        retired)
+            [ "$rc" -ne 0 ] && ! grep -q install "$CASE/apt.calls" &&
+                grep -q 'linux-image-cloud-amd64 linux-headers-cloud-amd64' "$CASE/output" &&
+                grep -q 'sudo reboot' "$CASE/output" ;;
+        update-failed) [ "$rc" -ne 0 ] && ! grep -q install "$CASE/apt.calls" ;;
+    esac
+)
+for scenario in installed available retired update-failed tools-only; do
+    expect "Debian exact headers handling: $scenario" debian_headers "$scenario"
+done
+for kernel in 5.10.0-30-cloud-amd64 6.1.0-42-cloud-amd64 6.12.57+deb13-cloud-amd64; do
+    expect "preserve Debian cloud flavour: $kernel" test "$(jool_debian_kernel_flavour "$kernel")" = cloud-amd64
+done
+expect 'preserve Debian generic flavour' test "$(jool_debian_kernel_flavour 6.1.0-42-amd64)" = amd64
+expect 'preserve Debian ARM cloud flavour' test "$(jool_debian_kernel_flavour 6.12.57+deb13-cloud-arm64)" = cloud-arm64
+expect 'do not replace a vendor kernel' bash -c 'source "$1"; ! jool_debian_kernel_flavour 6.1.0-vendor-amd64' _ "$ROOT/nft.sh"
+expect 'do not treat Ubuntu AWS as Debian' bash -c 'source "$1"; ! jool_debian_kernel_flavour 7.0.0-1014-aws' _ "$ROOT/nft.sh"
+
 installation() (
     fixture "installation-$1"
     case "$1" in

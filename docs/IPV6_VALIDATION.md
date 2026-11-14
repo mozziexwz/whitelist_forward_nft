@@ -117,11 +117,11 @@ sudo bash tests/kernel_reboot_test.sh cleanup /var/tmp/nft-kernel-reboot-accepta
 
 ## 开发包
 
-`bash scripts/package_release.sh` 生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，检查 Bash 语法、版本号、LF 和 SHA256。CI 的打包 job 依赖 ShellCheck、单元、netns、systemd、Jool 和 Docker/WireGuard 六项检查；本分支不创建正式标签或替换 Release。
+`bash scripts/package_release.sh` 生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，检查 Bash 语法、版本号、LF 和 SHA256。CI 的打包 job 依赖 ShellCheck、单元、netns、systemd、Jool、Docker/WireGuard 和 Debian 三版本矩阵检查；本分支不创建正式标签或替换 Release。
 
 ## 缺少 Jool 时的安装流程补充
 
-新增 `install-jool` / `check-jool`（菜单 13 / 14），解决普通 VPS 缺少依赖时只有报错、没有安装入口的问题。当前脚本 SHA256：`08f99fa4f7b18fc61dede3453afe2bb10a3ef0fe477c43c3e64ba1c025e81548`。
+新增 `install-jool` / `check-jool`（菜单 13 / 14），解决普通 VPS 缺少依赖时只有报错、没有安装入口的问题。首次依赖入口脚本 SHA256：`08f99fa4f7b18fc61dede3453afe2bb10a3ef0fe477c43c3e64ba1c025e81548`；Debian 旧 headers 处理的当前脚本 SHA256：`6dac21863fdd4456fd19cf7ed05a1a57691a4fa213eebcd167ef32960aab41fb`。
 
 | 场景 | 补充前 | 补充后 |
 |---|---|---|
@@ -134,3 +134,11 @@ sudo bash tests/kernel_reboot_test.sh cleanup /var/tmp/nft-kernel-reboot-accepta
 Windows 的 287 项、Debian 13 的 294 项原单元通过。新增 19 项隔离测试覆盖缺失、旧版、版本冲突、下载、校验、DKMS 和加载失败及部分/重复安装；模拟包管理与编译命令，不实际更换系统软件。Debian 13 已安装环境的只读检查与重复安装通过。
 
 GitHub Actions 的内核 job 现在从全新 runner 执行实际 `install-jool`、`check-jool`、重复安装，确认通用 Jool 服务未启动，然后执行原 84 项转换、38 项同号端口及 8 项 systemd 回滚。补充构建：[push](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43603242464)、[PR](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43603247376)。RHEL 系安装分支需要可用的 DKMS 仓库和当前内核 devel；本补充未新增 RHEL 全新安装验收，前述 Rocky 转发/重启验收使用已手动安装的相同官方版本。
+
+### Debian 11 / 12 / 13 与旧内核 headers
+
+用户反馈 Debian 12 的运行内核为 `6.1.0-42-cloud-amd64`，更新后的 APT 源已找不到该 ABI 的 headers。安装器现在先检查已安装头文件的 `kernel.release` 是否与运行内核完全一致；不存在时再检查精确包的 APT 候选版本。缺包时在安装其他构建依赖之前停止，并给出保持 cloud / 普通内核类型的内核与 headers 元包、重启、确认 `uname -r` 和重试步骤；不自动更换内核、重启、修改源或安装不匹配 headers。只有工具缺失、模块已匹配时不再强制要求 headers。
+
+隔离依赖测试扩展为 31 项，新增已安装 headers 复用、候选包存在/退役、APT 刷新失败、仅补工具、Debian 11/12/13 cloud 类型保持、普通/ARM 类型保持及第三方内核拒绝推断。
+
+新增三个独立 CI 容器矩阵：`debian:11`、`debian:12`、`debian:13`。每个矩阵执行原 Bash 单元和 31 项依赖测试，从该发行版软件源解析 cloud-amd64 / amd64 两类当前 headers，实际编译 Jool 工具、用 DKMS 为两个内核构建并安装模块，核对版本与 vermagic，并用各版原生 nftables 检查四方向生成规则。容器仅获 NET_ADMIN，使用自己的网络 namespace，规则只做 `--check`；不向容器宿主加载模块。这证明三版的依赖、构建和规则解析兼容；Debian 11 的实际 5.10 内核数据路径/重启仍未新增验收，不能把构建检查当作已实测转发。

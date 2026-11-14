@@ -49,6 +49,21 @@ bash nft.sh check-jool
 
 如安装失败，运行 `bash nft.sh check-jool` 获取具体缺项。缺少当前内核 headers/devel 时请修复软件源或自行安排更新内核后再试；受限容器、模块签名不被信任或内核不兼容时，DKMS 构建或模块加载仍会失败，安装器会保留实际错误并停止。其他发行版按 [Jool 官方安装说明](https://www.jool.mx/en/install.html)操作。
 
+Debian **11 / 12 / 13** 使用同一安装入口，按 `uname -r` 匹配当前运行内核，不固定 ABI 尾号。已安装且版本匹配的 headers 即使不在镜像中，也可继续复用。安装器先刷新 APT 索引并检查精确包的候选版本；旧内核 headers 已从源中移除时，在安装构建依赖之前停止，打印同类型内核元包和重启步骤。
+
+例如运行 `6.1.0-42-cloud-amd64` 而源中缺少对应 headers 时，由你自行安排：
+
+```bash
+sudo apt-get update
+sudo apt-get install --no-install-recommends --no-remove linux-image-cloud-amd64 linux-headers-cloud-amd64
+sudo reboot
+# 重新连接后确认已经进入新内核，再安装 Jool
+uname -r
+sudo bash nft.sh install-jool
+```
+
+普通 `-amd64` 内核对应 `linux-image-amd64` / `linux-headers-amd64`；`cloud-amd64` 保持 cloud 类型。[Debian 内核元包](https://www.debian.org/releases/bookworm/amd64/release-notes/ch-upgrading.en.html#kernel-metapackage)跟踪本机软件源中的内核与模块。仅安装最新 headers 不能给仍在运行的旧内核构建模块；重启后内核若没变，需检查 VPS 面板或引导器的内核选择。脚本只打印建议，不自动升级内核、重启或修改软件源。
+
 必须确认 DKMS 为**当前运行内核**成功构建，工具、磁盘模块和已加载模块版本一致；不需要启用发行版的通用 `jool.service`。本项目只创建自己的转换实例。其他发行版需按 [Jool 官方说明](https://www.jool.mx/en/documentation.html)准备适配模块，不能仅凭内核 ≥ 5.2 判断跨族功能可用。内核升级后也需确认模块重建成功。
 
 ## 安装与运行
@@ -187,7 +202,8 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 ## 开发与测试
 
 - `bash tests/unit_test.sh`：纯 bash 单元测试，不需要 root，Windows 的 Git Bash 也能运行
-- `sudo bash tests/jool_install_test.sh`：19 项隔离依赖测试；模拟安装工具，验证缺项、版本冲突、下载/校验/DKMS/加载失败及重复安装，不安装系统软件
+- `sudo bash tests/jool_install_test.sh`：31 项隔离依赖测试；验证缺项、版本冲突、下载/校验/DKMS/加载失败、部分/重复安装，以及 Debian 旧 headers 退役、已安装 headers 复用和内核类型建议，不安装系统软件
+- `tests/debian_build_test.sh`：仅用于一次性 CI 容器；Debian 11/12/13 原生依赖和工具、cloud/普通两类内核 headers + DKMS 模块编译与版本检查，并用各版 nftables 检查四方向规则；不加载模块，不证明容器宿主之外的实际内核数据路径
 - `sudo bash tests/netns_test.sh`：在隔离的 network namespace 里真实加载规则，测试转发和白名单；不改动宿主机的防火墙、`/etc` 和 systemd 服务
 - `sudo bash tests/kernel_netns_test.sh`：需已安装匹配的 Jool 工具/模块，在隔离 network/mount namespace 中验证四方向 TCP/UDP、端口段、重复目标、白名单、绕过路径、大包及实例故障恢复
 - `sudo bash tests/kernel_netns_test.sh --same-ports`：额外验证四方向同号端口段保持端口
