@@ -391,9 +391,26 @@ SH
     if [ "$ready" = 1 ]; then
         snap=$(cat "$WORK/driver.snapshot")
         kill -TERM "$driver"; wait "$driver" 2>/dev/null || true
-        if bash "$ROOT/nft.sh" apply > "$WORK/concurrent-rollback.log" 2>&1; then
-            echo 'FAIL: pending rollback admitted a newer transaction'; FAIL=$((FAIL + 1))
-        else echo 'PASS: pending rollback blocks newer transaction after disconnect'; PASS=$((PASS + 1)); fi
+        # Bash may finish the rollback synchronously when TERM interrupts read.
+        # Admission is valid only after that older transaction has completed.
+        cat > "$WORK/transaction-probe.sh" <<'SH'
+#!/bin/bash
+source "$1"
+trap end_action EXIT
+if begin_action; then
+    [ ! -d "$2" ] || [ -e "$2/completed" ] || exit 9
+    exit 0
+fi
+if [ -d "$2" ] && [ ! -e "$2/completed" ]; then exit 10; fi
+exit 11
+SH
+        gate_rc=0
+        bash "$WORK/transaction-probe.sh" "$ROOT/nft.sh" "$snap" > "$WORK/concurrent-rollback.log" 2>&1 || gate_rc=$?
+        if [ "$gate_rc" = 10 ]; then
+            echo 'PASS: pending rollback blocks newer transaction after disconnect'; PASS=$((PASS + 1))
+        elif [ "$gate_rc" = 0 ]; then
+            echo 'PASS: completed rollback permits a new transaction'; PASS=$((PASS + 1))
+        else echo 'FAIL: transaction admitted before rollback completion'; FAIL=$((FAIL + 1)); cat "$WORK/concurrent-rollback.log"; fi
         for ((i = 0; i < (NFT_KERNEL_ROLLBACK_TIMEOUT + 45) * 10; i++)); do [ -d "$snap" ] || break; sleep 0.1; done
         if [ ! -d "$snap" ] && ! grep -qF '32700' "$NFT_SH_FORWARD_FILE"; then
             echo 'PASS: disconnected control process rolls back kernel resources'; PASS=$((PASS + 1))
