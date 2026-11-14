@@ -45,6 +45,17 @@ jobs:
       - name: Run systemd integration tests
         run: sudo bash tests/systemd_test.sh
 
+  kernel:
+    name: Kernel IPv4/IPv6 translation (Jool)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install pinned Jool tools and matching kernel module
+        run: sudo env CI=true bash scripts/ci_install_jool.sh
+      - name: Run real dual-stack kernel forwarding tests
+        run: sudo bash tests/kernel_netns_test.sh
+
   coexistence:
     name: Integration tests (Docker and WireGuard)
     runs-on: ubuntu-latest
@@ -60,7 +71,7 @@ jobs:
   package:
     name: Validate release package
     runs-on: ubuntu-latest
-    needs: [shellcheck, unit, netns, systemd, coexistence]
+    needs: [shellcheck, unit, netns, systemd, kernel, coexistence]
     steps:
       - uses: actions/checkout@v4
       - name: Build and verify release assets

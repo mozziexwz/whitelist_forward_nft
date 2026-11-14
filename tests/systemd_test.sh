@@ -57,6 +57,7 @@ echo 1 > "$WHITELIST_ENABLED_FILE"
 apply_all_rules > "$WORK/baseline.log" 2>&1 || { cat "$WORK/baseline.log"; exit 1; }
 cp "$NFT_PERSIST_FILE" "$WORK/persist.before"
 nft -s list table inet unified > "$WORK/table.before"
+release_action_lock
 cat > "$WORK/driver.sh" <<'EOF'
 #!/bin/bash
 source "$1"

@@ -12,10 +12,17 @@ trap 'rm -rf "$WORK"' EXIT
 export NFT_SH_WHITELIST_FILE="$WORK/whitelist.txt"
 export NFT_SH_FORWARD_FILE="$WORK/forward.conf"
 export NFT_SH_ENABLED_FILE="$WORK/enabled"
+export NFT_SH_TRANSLATE_DIR="$WORK/translate"
+export NFT_SH_LIBEXEC_DIR="$WORK/libexec"
+export NFT_SH_SYSTEMD_DIR="$WORK/systemd"
+export NFT_SH_SYSCTL_FILE="$WORK/forward.sysctl"
 unset SSH_CONNECTION SSH_CLIENT
 
 # shellcheck source=../nft.sh
 source "$ROOT/nft.sh"
+
+# Windows Git Bash has no flock; concurrency is checked on real Linux separately.
+if ! command -v flock >/dev/null 2>&1; then flock() { return 0; }; fi
 
 # 不依赖本机实际监听的端口，测试结果在任何机器上都一样
 FAKE_LISTEN=""
@@ -159,6 +166,39 @@ no "端口数量不一致"   parse_forward_line '1-3|1.2.3.4|1-5'
 no "域名目标"         parse_forward_line '8080|example.com|80'
 no "注释行"           parse_forward_line '# 8080|1.2.3.4|80'
 no "空行"             parse_forward_line '   '
+
+eq "IPv6 入口及目标规范化" "8080 8080 2001:db8::10 80 80 ipv6" "$(parse_forward_line 'ipv6|08080|2001:0DB8::10|0080')"
+eq "IPv6 入站到 IPv4" "8080 8080 192.0.2.10 80 80 ipv6" "$(parse_forward_line 'ipv6|8080|192.0.2.10|80')"
+eq "IPv4 入站到 IPv6" "8080 8080 fd12::10 80 80 ipv4" "$(parse_forward_line 'ipv4|8080|fd12::10|80')"
+no "旧格式不推测 IPv6 入口" parse_forward_line '8080|2001:db8::10|80'
+no "无效地址族" parse_forward_line 'both|8080|192.0.2.10|80'
+for target in :: ::1 fe80::1 ff02::1 ::ffff:192.0.2.10 'fd12::10%eth0' '2001:db8::/64' '[2001:db8::10]'; do
+    no "拒绝不支持的 IPv6 目标 $target" validate_target_ip "$target"
+done
+printf '8080|192.0.2.10|80\nipv6|8080|2001:db8::10|80\n' > "$NFT_SH_FORWARD_FILE"
+no "双族同端口删除需要地址族" fwd_index_by_local 8080
+eq "明确 IPv6 删除选择正确条目" "2" "$(fwd_index_by_local 8080 ipv6)"
+ok "允许双族相同入口端口" precheck_forwards
+ok "IPv6 同族重叠能识别" forward_conflict 8080 8080 ipv6
+no "IPv4 不与单独 IPv6 规则冲突" forward_conflict 9090 9090 ipv4
+printf 'ipv6|10000-10002|2001:db8::10|20000-20002\n' > "$NFT_SH_FORWARD_FILE"
+rules=$(build_ruleset)
+has "原生 IPv6 DNAT 使用地址族" "$rules" 'dnat ip6 to [2001:db8::10]'
+has "IPv6 异号端口段顺序映射" "$rules" '10002 : 20002'
+has "IPv6 本机流量排除回环" "$rules" 'ip6 daddr != ::1 fib daddr type local'
+has "IPv6 SNAT 只限定 DNAT" "$rules" 'ct status dnat ip6 daddr 2001:db8::10'
+translation_settings
+eq "NAT64 合成目的地址" "fd73:6866:7400:64::c000:20a" "$(translation_synth6 192.0.2.10)"
+printf 'ipv4|32000-32002|2001:db8::10|20000-20002\nipv4|32100|2001:db8::10|20000\n' > "$NFT_SH_FORWARD_FILE"
+json=$(translation_json 46)
+has "静态映射覆盖段末端" "$json" '198.18.241.128#32002'
+has "相同真实目标使用不同虚拟端点" "$json" 'fd73:6866:7400:a46::7d64#20000'
+rules=$(build_ruleset)
+has "跨族先改为内部 IPv4 服务端点" "$rules" 'dnat ip to 198.18.241.128'
+has "转换后再同族改为真实 IPv6 目标" "$rules" 'dnat ip6 to 2001:db8::10'
+has "直接访问转换 veth 默认丢弃" "$rules" 'oifname "nftsh46" counter drop'
+has "入口按原始 IPv4 来源过滤" "$rules" 'ip saddr @allowed_ips'
+has "转换目标绑定到本项目原入口端口" "$rules" 'ct original proto-dst 32000-32002'
 
 printf '8080|1.2.3.4|80\n\n# note\nbad line\n9090|1.2.3.5|90' > "$NFT_SH_FORWARD_FILE"
 eq "末行无换行也能读到"   "2"          "$(list_forwards | wc -l | tr -d ' ')"
@@ -331,6 +371,11 @@ cat > "$FAKE_BIN/nft" <<'EOF'
 #!/bin/bash
 # 模拟 nft：记录调用；"已加载"的表以文件形式保存在 $FAKE_NFT_STATE/table_<名称>
 S="$FAKE_NFT_STATE"
+if [ "${1:-}" = "-c" ]; then
+    echo '-c (readonly precheck)' >> "$S/calls"
+    [ ! -e "$S/fail_precheck" ]
+    exit $?
+fi
 echo "$*" >> "$S/calls"
 case "${1:-} ${2:-}" in
     "list tables")
@@ -522,7 +567,7 @@ end_action
 begin_action
 wl_add 198.51.100.9 >/dev/null
 ROLLBACK_TIMEOUT=1
-no "未按回车的 y 超时仍回滚"         confirm_or_rollback < <(printf y; sleep 2)
+no "未按回车的 y 超时仍回滚"         confirm_or_rollback < <(release_action_lock; printf y; sleep 2)
 no "超时后配置已恢复"                grep -qF '198.51.100.9' "$NFT_SH_WHITELIST_FILE"
 end_action
 ROLLBACK_TIMEOUT=60
@@ -585,6 +630,41 @@ end_action
 eq "无效开关不会关闭白名单"          "1" "$(cat "$NFT_SH_ENABLED_FILE")"
 eq "无效备份不会部分覆盖白名单"      '203.0.113.7' "$(cat "$NFT_SH_WHITELIST_FILE")"
 CLI_MODE=0
+
+# Deployment is data, never executable shell input; only known unique keys.
+mkdir -p "$TRANSLATE_DIR"
+printf 'id=nftsh\nipv4=198.18.241\nipv6=fd73:6866:7400\n' > "$WORK/deployment.valid"
+ok "读取完整部署数据" translation_settings "$WORK/deployment.valid"
+printf 'id=nftsh\nid=other\nipv4=198.18.241\nipv6=fd73:6866:7400\n' > "$WORK/deployment.bad"
+no "拒绝重复部署键" translation_settings "$WORK/deployment.bad"
+printf 'id=$(touch %s)\nipv4=198.18.241\nipv6=fd73:6866:7400\n' "$WORK/executed" > "$WORK/deployment.bad"
+no "部署值不能执行命令" translation_settings "$WORK/deployment.bad"
+no "部署数据没有执行 shell 内容" test -e "$WORK/executed"
+printf 'unknown=value\nid=nftsh\nipv4=198.18.241\nipv6=fd73:6866:7400\n' > "$WORK/deployment.bad"
+no "拒绝未知部署键" translation_settings "$WORK/deployment.bad"
+no "不恢复动态接口索引" managed_forwarding_sysctl net/ipv6/conf/eth0/ifindex
+ok "恢复受管 IPv6 forwarding" managed_forwarding_sysctl net/ipv6/conf/eth0/forwarding
+ok "恢复上联 RA 设置" managed_forwarding_sysctl net/ipv6/conf/eth0/accept_ra
+ok "支持验收版本 Jool 4.1.15" translation_version_supported 4.1.15.0
+ok "支持同系列后续版本" translation_version_supported 4.1.16
+no "拒绝未通过分片验收的旧 Jool" translation_version_supported 4.1.13.0
+no "拒绝未经验证的新主版本" translation_version_supported 5.0.0
+no "拒绝无效模块版本" translation_version_supported '4.1.foo'
+if [ "$(type -t flock)" = file ]; then
+    begin_action
+    no "拒绝并发配置事务" bash -c 'source "$1"; trap end_action EXIT; begin_action' _ "$ROOT/nft.sh"
+    end_action
+    ok "事务结束后释放文件锁" bash -c 'source "$1"; trap end_action EXIT; begin_action' _ "$ROOT/nft.sh"
+    begin_action
+    pending_snapshot="$SNAPSHOT_DIR"
+    printf '%s\n' "$pending_snapshot" > "$FORWARD_FILE.lock"
+    release_action_lock
+    SNAPSHOT_DIR=""
+    no "断连后回滚未完成时拒绝新事务" bash -c 'source "$1"; trap end_action EXIT; begin_action' _ "$ROOT/nft.sh"
+    touch "$pending_snapshot/completed"
+    ok "回滚完成后允许新事务" bash -c 'source "$1"; trap end_action EXIT; begin_action' _ "$ROOT/nft.sh"
+    remove_snapshot_dir "$pending_snapshot"
+fi
 
 echo ""
 echo "单元测试: 通过 $PASS，失败 $FAIL"
