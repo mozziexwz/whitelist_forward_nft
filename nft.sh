@@ -600,7 +600,10 @@ build_translation_rules() {
             outp+=("ip6 daddr != ::1 fib daddr type local $p dport $lspec counter dnat ip6 to $rule_target $cmt")
             xguards+=("oifname \"$link\" ip6 daddr $synth $p dport $tspec ct status dnat ct original proto-dst $lspec $source_check counter accept")
             xguards+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter accept")
-            post+=("oifname \"$link\" fib saddr type local ct status dnat ip6 daddr $synth $p dport $tspec counter masquerade $cmt")
+            # Two ingress ports may resolve to the same synthetic endpoint.
+            # Allocate distinct source endpoints before Jool, after the host's
+            # original-source whitelist check, so reply tuples cannot collapse.
+            post+=("oifname \"$link\" ct status dnat ip6 daddr $synth $p dport $tspec counter masquerade fully-random $cmt")
             post+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter masquerade $cmt")
         done
     else

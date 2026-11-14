@@ -133,7 +133,10 @@ def client(src):
                 pending[('%s:%d:' % (target, backend_port)).encode() + payload] = port
                 sock.sendto(payload, (host, port))
             while pending:
-                data, peer = sock.recvfrom(65535)
+                try:
+                    data, peer = sock.recvfrom(65535)
+                except TimeoutError as error:
+                    raise AssertionError('%s: missing UDP replies from ingress ports %s' % (src, list(pending.values()))) from error
                 assert peer[:2] == (host, pending.pop(data)), (src, data, peer)
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
     list(pool.map(client, ('10.201.1.2', '10.201.1.4', '2001:db8:201::2', '2001:db8:201::4')))
