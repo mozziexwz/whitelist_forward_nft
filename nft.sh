@@ -4,7 +4,7 @@
 #
 #   - 白名单：启用后只有白名单 IP 能访问本机和转发端口
 #   - 端口转发：单端口 / 端口段，TCP+UDP，本地端口段与目标端口段一一对应
-#   - 规则一次性原子加载：要么全部生效，要么保持原样，不会只生效一半
+#   - nft 规则在单个事务中加载；跨族内核资源按阶段保护，失败恢复
 #   - 防失联：应用前检查当前 SSH 来源 IP；修改白名单后限时确认，超时自动回滚
 #
 # 不带参数运行进入交互菜单；运行 "bash nft.sh help" 查看命令行用法。
@@ -654,9 +654,17 @@ translation_guards() {
         "ip6 daddr $XL6:46::/96 oifname != \"${XL_ID}46\" drop")
 }
 
+translation_netns() {
+    local ns="$1"
+    shift
+    # The control tools need only the network namespace. ip -n / netns exec
+    # also remount /sys, which SELinux initrc_t correctly refuses on RHEL.
+    nsenter "--net=/run/netns/$ns" -- "$@"
+}
+
 translation_resource_owned() {
     local mode="$1"
-    ip -n "$XL_ID$mode" -d -o link show lo 2>/dev/null | grep -qF "alias nft.sh:$XL_ID:$mode"
+    translation_netns "$XL_ID$mode" ip -d -o link show lo 2>/dev/null | grep -qF "alias nft.sh:$XL_ID:$mode"
 }
 
 translation_version_supported() {
@@ -681,7 +689,7 @@ translation_precheck() {
         error '转换资源仍在使用旧部署参数；请先删除跨族规则，再修改部署参数'
         return 1
     fi
-    for tool in ip ss jool modprobe modinfo; do
+    for tool in ip ss nsenter jool modprobe modinfo; do
         command -v "$tool" >/dev/null || { error "跨族转发需要 $tool（Jool 工具和匹配的内核模块）"; return 1; }
     done
     modprobe -n jool >/dev/null 2>&1 || { error "当前内核 $(uname -r) 没有可用 Jool 模块，请安装匹配的 DKMS/headers"; return 1; }
@@ -744,7 +752,7 @@ translation_remove() {
         fi
         if translation_resource_owned "$mode"; then
             if command -v jool >/dev/null; then
-                ip netns exec "$XL_ID$mode" jool instance remove nft-sh >/dev/null 2>&1 || true
+                translation_netns "$XL_ID$mode" jool instance remove nft-sh >/dev/null 2>&1 || true
             fi
             ip netns del "$XL_ID$mode" || rc=1
         fi
@@ -791,27 +799,27 @@ translation_setup() {
         host4="$XL4.$offset"; peer4="$XL4.$((offset + 1))"
         host6="$XL6:$([ "$mode" = 64 ] && echo 1 || echo 2)::1"
         peer6="${host6%1}2"; pool6="$XL6:$mode::/96"
-        ip netns add "$ns" && ip -n "$ns" link set lo alias "nft.sh:$XL_ID:$mode" || return 1
+        ip netns add "$ns" && translation_netns "$ns" ip link set lo alias "nft.sh:$XL_ID:$mode" || return 1
         ip link add "$link" type veth peer name peer && ip link set "$link" alias "nft.sh:$XL_ID:$mode" || return 1
         ip link set peer netns "$ns" && sysctl -qw "net/ipv6/conf/$link/accept_dad=0" &&
-            ip netns exec "$ns" sysctl -qw net/ipv6/conf/peer/accept_dad=0 && ip addr add "$host4/30" dev "$link" &&
+            translation_netns "$ns" sysctl -qw net/ipv6/conf/peer/accept_dad=0 && ip addr add "$host4/30" dev "$link" &&
             ip -6 addr add "$host6/64" dev "$link" nodad && ip link set "$link" up || return 1
-        ip -n "$ns" addr add "$peer4/30" dev peer && ip -n "$ns" -6 addr add "$peer6/64" dev peer nodad &&
-            ip -n "$ns" link set peer up && ip -n "$ns" link set lo up || return 1
-        ip -n "$ns" route add default via "$host4" && ip -n "$ns" -6 route add default via "$host6" || return 1
-        ip netns exec "$ns" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 || return 1
+        translation_netns "$ns" ip addr add "$peer4/30" dev peer && translation_netns "$ns" ip -6 addr add "$peer6/64" dev peer nodad &&
+            translation_netns "$ns" ip link set peer up && translation_netns "$ns" ip link set lo up || return 1
+        translation_netns "$ns" ip route add default via "$host4" && translation_netns "$ns" ip -6 route add default via "$host6" || return 1
+        translation_netns "$ns" sysctl -qw net.ipv4.ip_forward=1 net.ipv6.conf.all.forwarding=1 || return 1
         printf 'table inet untranslated_guard {\n chain forward { type filter hook forward priority filter; policy drop; }\n}\n' |
-            ip netns exec "$ns" nft -f - || return 1
+            translation_netns "$ns" nft -f - || return 1
         # Always create a fresh instance: Jool file updates ignore the bib tag.
         config=$(mktemp) || return 1
         # These private pool addresses are not assigned to interfaces, and this
         # dedicated namespace has no TCP/UDP sockets. Acknowledge Jool 4.1.15's
         # ephemeral-port overlap warning here, never in the host namespace.
-        sockets=$(ip netns exec "$ns" ss -Han -t -u) || { rm -f "$config"; return 1; }
+        sockets=$(translation_netns "$ns" ss -Han -t -u) || { rm -f "$config"; return 1; }
         if [ -n "$sockets" ]; then
             error "转换 namespace $ns 出现未预期的 TCP/UDP socket"; rm -f "$config"; return 1
         fi
-        if ! translation_json "$mode" > "$config" || ! ip netns exec "$ns" jool file handle "$config" --force; then
+        if ! translation_json "$mode" > "$config" || ! translation_netns "$ns" jool file handle "$config" --force; then
             rm -f "$config"; return 1
         fi
         rm -f "$config"
@@ -944,7 +952,7 @@ translation_current() {
     for mode in 64 46; do
         translation_mode_needed "$mode" || continue
         translation_resource_owned "$mode" || return 1
-        ip netns exec "$XL_ID$mode" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE' || return 1
+        translation_netns "$XL_ID$mode" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE' || return 1
         if [ "$mode" = 64 ]; then
             ip -4 route show "$XL4.64/32" | grep -qF "dev $XL_ID$mode" || return 1
         else
@@ -955,7 +963,7 @@ translation_current() {
         [ -f "$TRANSLATE_DIR/live.pool$mode" ] && [ "$live" = "$(cat "$TRANSLATE_DIR/live.pool$mode")" ] || return 1
         if [ "$mode" = 46 ]; then
             for proto in tcp udp; do
-                live=$(set -o pipefail; ip netns exec "$XL_ID$mode" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) || return 1
+                live=$(set -o pipefail; translation_netns "$XL_ID$mode" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) || return 1
                 [ "$live" = "$(cat "$TRANSLATE_DIR/live.$proto" 2>/dev/null)" ] || return 1
             done
         fi
@@ -966,7 +974,7 @@ translation_pool_state() {
     local proto
     for proto in tcp udp icmp; do
         printf '%s\n' "$proto"
-        ip netns exec "$XL_ID$1" jool -i nft-sh pool4 display "--$proto" --csv --no-headers || return 1
+        translation_netns "$XL_ID$1" jool -i nft-sh pool4 display "--$proto" --csv --no-headers || return 1
     done
 }
 
@@ -989,7 +997,7 @@ translation_record() {
     done
     if translation_mode_needed 46; then
         for proto in tcp udp; do
-            (set -o pipefail; ip netns exec "${XL_ID}46" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) > "$TRANSLATE_DIR/live.$proto" || return 1
+            (set -o pipefail; translation_netns "${XL_ID}46" jool -i nft-sh bib display "--$proto" --numeric --csv --no-headers | LC_ALL=C sort) > "$TRANSLATE_DIR/live.$proto" || return 1
         done
     else
         rm -f "$TRANSLATE_DIR/live.tcp" "$TRANSLATE_DIR/live.udp"
@@ -1059,14 +1067,14 @@ translation_status() {
     for mode in 64 46; do
         translation_mode_needed "$mode" || continue
         prefix="$XL_ID$mode"
-        if translation_resource_owned "$mode" && ip netns exec "$prefix" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE'; then
+        if translation_resource_owned "$mode" && translation_netns "$prefix" jool -i nft-sh global display --csv 2>/dev/null | grep -qx 'manually-enabled,TRUE'; then
             echo "  $mode: $prefix 已启用，转换前缀 $XL6:$mode::/96"
             if [ "$mode" = 64 ]; then echo "    动态 IPv4 池: $XL4.64"
             else echo "    静态 IPv4 池: $XL4.128"; fi
             translation_pool_state "$mode" 2>/dev/null
             if [ "$mode" = 46 ]; then
-                ip netns exec "$prefix" jool -i nft-sh bib display --tcp --numeric --csv 2>/dev/null
-                ip netns exec "$prefix" jool -i nft-sh bib display --udp --numeric --csv 2>/dev/null
+                translation_netns "$prefix" jool -i nft-sh bib display --tcp --numeric --csv 2>/dev/null
+                translation_netns "$prefix" jool -i nft-sh bib display --udp --numeric --csv 2>/dev/null
             fi
         else
             echo "  $mode: $prefix 未就绪（模块、实例或权限异常）"
@@ -1746,7 +1754,7 @@ precheck_forwards() {
     return 0
 }
 
-# 应用完整规则（原子操作），成功后写入持久化配置
+# 应用完整 nft 规则，跨族资源按阶段保护，成功后写入持久化配置
 apply_all_rules() {
     local rules live err wl_count fw_count confirm=0 cross_change=0
     case "$SNAPSHOT_DIR" in */nft-sh.*) [ -d "$SNAPSHOT_DIR" ] || return 1 ;; *) error '应用前必须建立有效快照'; return 1 ;; esac

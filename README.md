@@ -30,7 +30,7 @@
 
 - Linux 内核 ≥ 5.2（inet 表的 NAT 需要）
 - nftables：`apt install nftables`（Debian/Ubuntu）或 `dnf install nftables`（RHEL 系）
-- bash ≥ 4、root 权限，`flock`（util-linux）；IPv6 需要 iproute2
+- bash ≥ 4、root 权限，`flock`（util-linux）；IPv6 需要 iproute2，跨族另需 util-linux 的 `nsenter`
 - 使用跨族规则还需要 **版本匹配的 Jool 4.1.15 或更新的 4.1 系列工具和内核模块**、namespace/veth 和两族 forwarding 权限，开机恢复需要 systemd
 - VPS 必须具备入口族可达地址及通往目标族的地址和路由；受限容器 VPS 可能无法加载模块。同族规则不需要安装 Jool
 

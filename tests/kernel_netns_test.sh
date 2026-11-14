@@ -79,7 +79,7 @@ def serve(proto, port):
                     if not part: break
                     data.extend(part)
                 conn.sendall(tag + data)
-for port in (20000, 20001, 20002):
+for port in (20000, 20001, 20002, 35000, 35001, 35002, 35010, 35011, 35012, 36000, 36001, 36002):
     for proto in (socket.SOCK_STREAM, socket.SOCK_DGRAM):
         threading.Thread(target=serve, args=(proto, port), daemon=True).start()
 threading.Event().wait()
@@ -246,6 +246,14 @@ ipv4|32100|2001:db8:202::2|20000
 ipv6|34000-34002|2001:db8:202::2|20000-20002
 34000-34002|10.201.2.2|20000-20002
 CONF
+    if [ "${2:-}" = --same-ports ]; then
+        cat >> "$NFT_SH_FORWARD_FILE" <<'CONF'
+ipv6|35000-35002|10.201.2.2|35000-35002
+ipv4|35010-35012|2001:db8:202::2|35010-35012
+ipv6|36000-36002|2001:db8:202::2|36000-36002
+36000-36002|10.201.2.2|36000-36002
+CONF
+    fi
     printf '1\n' > "$NFT_SH_ENABLED_FILE"
     bash "$ROOT/nft.sh" apply
 fi
@@ -281,6 +289,18 @@ if [ "${2:-}" != --probe ]; then
     fi
     if [ "${2:-}" = --concurrency ]; then
         printf 'Concurrency probe: %s passed, %s failed\n' "$PASS" "$FAIL"
+        [ "$FAIL" -eq 0 ]; exit $?
+    fi
+    if [ "${2:-}" = --same-ports ]; then
+        for proto in tcp udp; do
+            for offset in 0 1 2; do
+                expect "$proto same-number IPv6 -> IPv4 $offset" allow "$proto" 2001:db8:201::1 "$((35000 + offset))" 2001:db8:201::2 10.201.2.2 "$((35000 + offset))" 99
+                expect "$proto same-number IPv4 -> IPv6 $offset" allow "$proto" 10.201.1.1 "$((35010 + offset))" 10.201.1.2 2001:db8:202::2 "$((35010 + offset))" 99
+                expect "$proto same-number IPv6 -> IPv6 $offset" allow "$proto" 2001:db8:201::1 "$((36000 + offset))" 2001:db8:201::2 2001:db8:202::2 "$((36000 + offset))" 99
+                expect "$proto same-number IPv4 -> IPv4 $offset" allow "$proto" 10.201.1.1 "$((36000 + offset))" 10.201.1.2 10.201.2.2 "$((36000 + offset))" 99
+            done
+        done
+        printf 'Same-number ranges: %s passed, %s failed\n' "$PASS" "$FAIL"
         [ "$FAIL" -eq 0 ]; exit $?
     fi
     for proto in tcp udp; do
