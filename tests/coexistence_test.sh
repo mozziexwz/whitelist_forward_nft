@@ -100,16 +100,23 @@ umask 077
 for peer in host a b; do wg genkey > "$WORK/$peer.key"; wg pubkey < "$WORK/$peer.key" > "$WORK/$peer.pub"; done
 ip link add "$WG" type wireguard; WG_CREATED=1
 ip addr add 10.239.31.1/24 dev "$WG"
-wg set "$WG" private-key "$WORK/host.key" listen-port 51859 \
-    peer "$(cat "$WORK/a.pub")" allowed-ips 10.239.31.2/32 \
-    peer "$(cat "$WORK/b.pub")" allowed-ips 10.239.31.3/32
+# 通过标准输入传递密钥，兼容对临时文件路径有访问限制的 wg/ip 执行环境。
+(
+    set -o pipefail
+    cat "$WORK/host.key" | wg set "$WG" private-key /dev/stdin listen-port 51859 \
+        peer "$(cat "$WORK/a.pub")" allowed-ips 10.239.31.2/32 \
+        peer "$(cat "$WORK/b.pub")" allowed-ips 10.239.31.3/32
+)
 ip link set "$WG" up
 setup_peer() {
     local ns="$1" peer="$2" inner="$3" endpoint="$4"
     ip -n "$ns" link add wg0 type wireguard
     ip -n "$ns" addr add "$inner/32" dev wg0
-    ip netns exec "$ns" wg set wg0 private-key "$WORK/$peer.key" peer "$(cat "$WORK/host.pub")" \
-        endpoint "$endpoint:51859" allowed-ips 10.239.31.0/24,198.19.237.0/24 persistent-keepalive 1
+    (
+        set -o pipefail
+        cat "$WORK/$peer.key" | ip netns exec "$ns" wg set wg0 private-key /dev/stdin peer "$(cat "$WORK/host.pub")" \
+            endpoint "$endpoint:51859" allowed-ips 10.239.31.0/24,198.19.237.0/24 persistent-keepalive 1
+    )
     ip -n "$ns" link set wg0 up
     ip -n "$ns" route add 10.239.31.0/24 dev wg0
     ip -n "$ns" route add 198.19.237.0/24 dev wg0
