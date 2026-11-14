@@ -16,12 +16,18 @@ set -u
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCRIPT="$ROOT/nft.sh"
 WORK="$(mktemp -d)"
-CLI=nfttest_cli
-RELAY=nfttest_relay
-TGT=nfttest_tgt
+CLI="nfttest_cli_$$"
+RELAY="nfttest_relay_$$"
+TGT="nfttest_tgt_$$"
+C_LINK="nc$$"
+R0_LINK="nr$$"a
+T_LINK="nt$$"
+R1_LINK="nr$$"b
 PASS=0
 FAIL=0
 PIDS=()
+CREATED_NS=()
+CREATED_LINKS=()
 # 模拟管理员从客户端 10.10.1.2 通过 SSH 登录中转机。必须显式设置：
 # 否则通过 SSH 运行本测试时，nft.sh 会沿父进程读到真实的 SSH 连接
 DEFAULT_ENV=("SSH_CONNECTION=10.10.1.2 50000 10.10.1.1 22")
@@ -42,12 +48,15 @@ chmod +x "$WORK/bin/systemctl"
 export PATH="$WORK/bin:$PATH"
 
 cleanup() {
-    local p ns
+    local p ns dev
     for p in "${PIDS[@]}"; do
         kill "$p" 2>/dev/null
     done
-    for ns in "$CLI" "$RELAY" "$TGT"; do
+    for ns in "${CREATED_NS[@]}"; do
         ip netns del "$ns" 2>/dev/null
+    done
+    for dev in "${CREATED_LINKS[@]}"; do
+        ip link del "$dev" 2>/dev/null
     done
     rm -rf "$WORK"
 }
@@ -126,10 +135,11 @@ write_helpers() {
 import socket, sys, threading
 
 host, tag = sys.argv[1], sys.argv[2]
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
 ports = [int(p) for p in sys.argv[3:]]
 
 def tcp(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket(family, socket.SOCK_STREAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     s.bind((host, port))
     s.listen(16)
@@ -139,7 +149,7 @@ def tcp(port):
         c.close()
 
 def udp(port):
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s = socket.socket(family, socket.SOCK_DGRAM)
     s.bind((host, port))
     while True:
         _, addr = s.recvfrom(100)
@@ -156,7 +166,8 @@ import socket, sys
 
 proto, host, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
 src = sys.argv[4] if len(sys.argv) > 4 else None
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
+family = socket.AF_INET6 if ":" in host else socket.AF_INET
+s = socket.socket(family, socket.SOCK_STREAM if proto == "tcp" else socket.SOCK_DGRAM)
 s.settimeout(2)
 if src:
     s.bind((src, 0))
@@ -170,33 +181,41 @@ EOF
 }
 
 setup_network() {
-    ip netns add "$CLI"
-    ip netns add "$RELAY"
-    ip netns add "$TGT"
-    ip link add nfttest_c0 type veth peer name nfttest_r0
-    ip link add nfttest_t0 type veth peer name nfttest_r1
-    ip link set nfttest_c0 netns "$CLI"
-    ip link set nfttest_r0 netns "$RELAY"
-    ip link set nfttest_r1 netns "$RELAY"
-    ip link set nfttest_t0 netns "$TGT"
+    ip netns add "$CLI" || return 1
+    CREATED_NS+=("$CLI")
+    ip netns add "$RELAY" || return 1
+    CREATED_NS+=("$RELAY")
+    ip netns add "$TGT" || return 1
+    CREATED_NS+=("$TGT")
+    ip link add "$C_LINK" type veth peer name "$R0_LINK" || return 1
+    CREATED_LINKS+=("$C_LINK" "$R0_LINK")
+    ip link add "$T_LINK" type veth peer name "$R1_LINK" || return 1
+    CREATED_LINKS+=("$T_LINK" "$R1_LINK")
+    ip link set "$C_LINK" netns "$CLI" || return 1
+    ip link set "$R0_LINK" netns "$RELAY" || return 1
+    ip link set "$R1_LINK" netns "$RELAY" || return 1
+    ip link set "$T_LINK" netns "$TGT" || return 1
 
-    ip -n "$CLI" addr add 10.10.1.2/24 dev nfttest_c0
-    ip -n "$CLI" addr add 10.10.1.3/24 dev nfttest_c0
-    ip -n "$CLI" link set nfttest_c0 up
-    ip -n "$CLI" link set lo up
-    ip -n "$CLI" route add default via 10.10.1.1
+    ip -n "$CLI" addr add 10.10.1.2/24 dev "$C_LINK" || return 1
+    ip -n "$CLI" addr add 10.10.1.3/24 dev "$C_LINK" || return 1
+    ip -n "$CLI" -6 addr add 2001:db8:1::2/64 dev "$C_LINK" nodad || return 1
+    ip -n "$CLI" -6 addr add 2001:db8:1::3/64 dev "$C_LINK" nodad || return 1
+    ip -n "$CLI" link set "$C_LINK" up || return 1
+    ip -n "$CLI" link set lo up || return 1
+    ip -n "$CLI" route add default via 10.10.1.1 || return 1
 
-    ip -n "$RELAY" addr add 10.10.1.1/24 dev nfttest_r0
-    ip -n "$RELAY" addr add 10.10.2.1/24 dev nfttest_r1
-    ip -n "$RELAY" link set nfttest_r0 up
-    ip -n "$RELAY" link set nfttest_r1 up
-    ip -n "$RELAY" link set lo up
+    ip -n "$RELAY" addr add 10.10.1.1/24 dev "$R0_LINK" || return 1
+    ip -n "$RELAY" addr add 10.10.2.1/24 dev "$R1_LINK" || return 1
+    ip -n "$RELAY" -6 addr add 2001:db8:1::1/64 dev "$R0_LINK" nodad || return 1
+    ip -n "$RELAY" link set "$R0_LINK" up || return 1
+    ip -n "$RELAY" link set "$R1_LINK" up || return 1
+    ip -n "$RELAY" link set lo up || return 1
 
     # 目标机故意不设默认路由：如果没有 masquerade，回包到不了客户端，转发测试会失败
-    ip -n "$TGT" addr add 10.10.2.2/24 dev nfttest_t0
-    ip -n "$TGT" addr add 10.10.2.3/24 dev nfttest_t0
-    ip -n "$TGT" link set nfttest_t0 up
-    ip -n "$TGT" link set lo up
+    ip -n "$TGT" addr add 10.10.2.2/24 dev "$T_LINK" || return 1
+    ip -n "$TGT" addr add 10.10.2.3/24 dev "$T_LINK" || return 1
+    ip -n "$TGT" link set "$T_LINK" up || return 1
+    ip -n "$TGT" link set lo up || return 1
 }
 
 start_servers() {
@@ -206,7 +225,84 @@ start_servers() {
     PIDS+=("$!")
     ip netns exec "$RELAY" python3 "$WORK/server.py" 0.0.0.0 relay 9999 &
     PIDS+=("$!")
+    ip netns exec "$RELAY" python3 "$WORK/server.py" 2001:db8:1::1 relay6 9999 &
+    PIDS+=("$!")
     sleep 1
+}
+
+run_rollback_driver() {
+    ip netns exec "$RELAY" env "${DEFAULT_ENV[@]}" \
+        bash "$WORK/rollback-driver.sh" "$SCRIPT" "$WORK" "${1:-2}"
+}
+
+test_rollback() {
+    local confirm_fd driver_pid foreground_pid ready=0 i snap
+    cat > "$WORK/rollback-driver.sh" <<'EOF'
+#!/bin/bash
+source "$1"
+INTERACTIVE=1
+ROLLBACK_TIMEOUT="$3"
+begin_action || exit 1
+trap end_action EXIT
+printf '%s' "$SNAPSHOT_DIR" > "$2/rollback.snapshot"
+printf '%s' "$BASHPID" > "$2/rollback.pid"
+wl_remove 10.10.1.3 >/dev/null || exit 1
+CONFIRM_ALWAYS=1
+apply_all_rules
+EOF
+
+    echo "== 确认与超时回滚 =="
+    run_ok "为回滚测试添加第二个客户端" add-ip 10.10.1.3
+    if run_rollback_driver <<< n > "$WORK/rollback.log" 2>&1; then
+        fail "拒绝确认应返回失败"
+    else
+        pass "拒绝确认返回失败"
+    fi
+    expect "拒绝后恢复原白名单" "relay:9999" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+
+    if run_rollback_driver 1 < <(sleep 2) > "$WORK/rollback.log" 2>&1; then
+        fail "等待确认超时应返回失败"
+    else
+        pass "等待确认超时返回失败"
+    fi
+    expect "超时后恢复原白名单" "relay:9999" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+
+    check "确认 y 后应用成功" run_rollback_driver <<< y
+    expect_blocked "确认后新的白名单保持生效" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+    run_ok "恢复第二个客户端供后台回滚测试" add-ip 10.10.1.3
+
+    # 保持 stdin 打开但不输入，等真实 apply 进入确认界面后终止主脚本。
+    # 后台 setsid 任务必须保留中转机命名空间，且在前台退出后仍能恢复规则。
+    mkfifo "$WORK/confirm.fifo"
+    exec {confirm_fd}<>"$WORK/confirm.fifo"
+    run_rollback_driver < "$WORK/confirm.fifo" > "$WORK/rollback.log" 2>&1 &
+    driver_pid=$!
+    PIDS+=("$driver_pid")
+    for ((i = 0; i < 30; i++)); do
+        if grep -q '确认正常请在' "$WORK/rollback.log"; then ready=1; break; fi
+        sleep 0.05
+    done
+    if [ "$ready" -eq 1 ]; then
+        snap=$(cat "$WORK/rollback.snapshot")
+        foreground_pid=$(cat "$WORK/rollback.pid")
+        kill -TERM "$foreground_pid"
+        wait "$driver_pid" 2>/dev/null || true
+        pass "规则加载后终止前台进程"
+        expect_blocked "后台回滚前删减后的规则已生效" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+        for ((i = 0; i < 100; i++)); do
+            [ -d "$snap" ] || break
+            sleep 0.1
+        done
+        check "后台任务完成并清理快照" test ! -d "$snap"
+        expect "前台退出后后台恢复了真实规则" "relay:9999" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+        check "前台退出后后台恢复了配置文件" grep -qx '10.10.1.3' "$NFT_SH_WHITELIST_FILE"
+    else
+        fail "前台进程未进入确认界面"
+        cat "$WORK/rollback.log"
+        kill -TERM "$driver_pid" 2>/dev/null
+        wait "$driver_pid" 2>/dev/null || true
+    fi
+    exec {confirm_fd}>&-
 }
 
 main() {
@@ -224,7 +320,7 @@ main() {
     done
 
     write_helpers
-    setup_network
+    setup_network || { echo "创建隔离网络失败"; exit 1; }
     start_servers
 
     echo 1 > "$NFT_SH_ENABLED_FILE"
@@ -236,8 +332,9 @@ main() {
     run_fail "拒绝域名" add-ip example.com
     run_fail "白名单为空时，非交互模式拒绝应用（防失联）" apply
     run_ok   "添加白名单 10.10.1.2" add-ip 10.10.1.2
-    run_ok   "添加 IPv6 CIDR" add-ip 2001:db8::1/32
-    check    "CIDR 主机位已清零" grep -qx "2001:db8::/32" "$NFT_SH_WHITELIST_FILE"
+    run_ok   "添加 IPv6 CIDR" add-ip 2001:db8:2::1/64
+    check    "CIDR 主机位已清零" grep -qx "2001:db8:2::/64" "$NFT_SH_WHITELIST_FILE"
+    run_ok   "添加 IPv6 客户端" add-ip 2001:db8:1::2
     run_fail "拒绝重复添加" add-ip 10.10.1.2
     run_ok   "添加单端口转发 8080 -> 10.10.2.2:80" add-forward 8080 10.10.2.2 80
     run_ok   "添加端口段转发 10000-10002 -> 20000-20002" add-forward 10000-10002 10.10.2.2 20000-20002
@@ -259,7 +356,7 @@ main() {
     check "inet unified 表已加载" grep -q "table inet unified" <<< "$listing"
     check "DNAT 写法为 dnat ip to" grep -q "dnat ip to 10.10.2.2:80" <<< "$listing"
     check "端口映射表已加载" grep -q "10001 : 20001" <<< "$listing"
-    check "IPv6 白名单已加载" grep -q "2001:db8::/32" <<< "$listing"
+    check "IPv6 白名单已加载" grep -q "2001:db8:2::/64" <<< "$listing"
     check "input 默认拒绝" grep -q "policy drop" <<< "$listing"
     check "持久化文件写到了测试目录" test -s "$NFT_SH_PERSIST_DIR/unified.nft"
     check "include 行写到了测试用的主配置" grep -qxF "include \"$NFT_SH_PERSIST_DIR/unified.nft\"" "$NFT_SH_MAIN_CONF"
@@ -278,15 +375,28 @@ main() {
     expect_blocked "非白名单 IP 不能访问本机服务" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
     expect "本机访问其他服务器的同号端口不会被劫持" "other:8080" "$RELAY" tcp 10.10.2.3 8080
     expect "本机访问自己的转发端口" "target:80" "$RELAY" tcp 10.10.1.1 8080
+    expect "IPv6 白名单 TCP 可以访问本机" "relay6:9999" "$CLI" tcp 2001:db8:1::1 9999 2001:db8:1::2
+    expect "IPv6 白名单 UDP 可以访问本机" "relay6:9999" "$CLI" udp 2001:db8:1::1 9999 2001:db8:1::2
+    expect_blocked "IPv6 非白名单 TCP 被拦截" "$CLI" tcp 2001:db8:1::1 9999 2001:db8:1::3
+    expect_blocked "IPv6 非白名单 UDP 被拦截" "$CLI" udp 2001:db8:1::1 9999 2001:db8:1::3
+
+    # 前面的测试先证明无回程路由也能通过 masquerade 转发；再补路由验证普通转发流量。
+    check "添加普通路由流量的回程路由" ip -n "$TGT" route add 10.10.1.0/24 via 10.10.2.1
+    expect "客户端访问外部同号端口不会被劫持" "other:8080" "$CLI" tcp 10.10.2.3 8080 10.10.1.2
+    expect "非白名单的普通路由 TCP 不受影响" "other:8080" "$CLI" tcp 10.10.2.3 8080 10.10.1.3
+    expect "非白名单的普通路由 UDP 不受影响" "other:8080" "$CLI" udp 10.10.2.3 8080 10.10.1.3
 
     echo "== 白名单开关与删除 =="
     run_ok "关闭白名单" whitelist off
     expect "关闭后任意 IP 可以使用转发" "target:80" "$CLI" tcp 10.10.1.1 8080 10.10.1.3
     expect "关闭后任意 IP 可以访问本机服务" "relay:9999" "$CLI" tcp 10.10.1.1 9999 10.10.1.3
+    expect "关闭后 IPv6 非白名单也可访问" "relay6:9999" "$CLI" tcp 2001:db8:1::1 9999 2001:db8:1::3
     run_ok "重新启用白名单" whitelist on
     expect_blocked "重新启用后非白名单 IP 被拦截" "$CLI" tcp 10.10.1.1 8080 10.10.1.3
     run_ok "删除端口段转发" del-forward 10000-10002
     expect_blocked "删除后不再转发" "$CLI" tcp 10.10.1.1 10001 10.10.1.2
+
+    test_rollback
 
     echo "== 与其他表共存 =="
     legacy="$WORK/legacy.nft"
@@ -297,6 +407,12 @@ main() {
         'table inet unified_nat {' \
         '}' > "$legacy"
     check "创建用户表和旧版本遗留表" ip netns exec "$RELAY" nft -f "$legacy"
+    if run_rollback_driver <<< n > "$WORK/rollback.log" 2>&1; then
+        fail "升级规则拒绝确认应回滚"
+    else
+        pass "升级规则拒绝确认返回失败"
+    fi
+    check "升级回滚恢复旧版本遗留表" ip netns exec "$RELAY" nft list table inet unified_nat
     run_ok "重新应用规则" apply
     check "保留用户自己的 inet filter 表" ip netns exec "$RELAY" nft list table inet filter
     if ip netns exec "$RELAY" nft list table inet unified_nat >/dev/null 2>&1; then

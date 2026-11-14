@@ -152,6 +152,9 @@ eq "单端口行"         "8080 8080 1.2.3.4 80 80"           "$(parse_forward_l
 eq "CRLF 行"          "8080 8080 1.2.3.4 80 80"           "$(parse_forward_line $'8080|1.2.3.4|80\r')"
 eq "端口段行"         "10000 10002 1.2.3.4 20000 20002"   "$(parse_forward_line '10000-10002|1.2.3.4|20000-20002')"
 no "多余字段"         parse_forward_line '8080|1.2.3.4|x|80'
+no "末尾多余分隔符"   parse_forward_line '8080|1.2.3.4|80|'
+no "配置中的回环目标" parse_forward_line '8080|127.0.0.1|80'
+no "配置中的组播目标" parse_forward_line '8080|239.1.1.1|80'
 no "端口数量不一致"   parse_forward_line '1-3|1.2.3.4|1-5'
 no "域名目标"         parse_forward_line '8080|example.com|80'
 no "注释行"           parse_forward_line '# 8080|1.2.3.4|80'
@@ -201,9 +204,11 @@ eq "IPv6 去掉 zone"       "fe80::1"      "$(SSH_CONNECTION='fe80::1%eth0 50000
 eq "只有 SSH_CLIENT"      "203.0.113.9"  "$(SSH_CLIENT='203.0.113.9 50000 22' get_current_ssh_ip)"
 has "SSH 服务端口"        "$(SSH_CONNECTION='203.0.113.9 50000 10.0.0.1 2222' get_ssh_ports)" "2222"
 if [ "$(uname -s)" = "Linux" ] && [ -r "/proc/$$/environ" ]; then
-    # 模拟 sudo：父进程有 SSH_CONNECTION，脚本自己的环境里没有（依赖 Linux 的 /proc）
+    # 模拟 sudo：父进程有 SSH_CONNECTION，脚本自己的环境里没有（依赖 Linux 的 /proc）。
+    # 中间那层 bash 要用命令替换去调用，否则 bash 会直接 exec 最后一条命令，这层父进程就不存在了
     got=$(env SSH_CONNECTION="198.51.100.20 40000 10.0.0.1 22" bash -c \
-        'env -u SSH_CONNECTION -u SSH_CLIENT bash -c "source \"\$1\"; get_ssh_connection" _ "$1"' _ "$ROOT/nft.sh")
+        'out=$(env -u SSH_CONNECTION -u SSH_CLIENT bash -c "source \"\$1\"; get_ssh_connection" _ "$1"); printf "%s" "$out"' \
+        _ "$ROOT/nft.sh")
     eq "sudo 后沿父进程找到 SSH 连接" "198.51.100.20 40000 10.0.0.1 22" "$got"
 fi
 
@@ -271,6 +276,16 @@ rules=$(build_ruleset 2>/dev/null)
 lacks "空白名单不生成 elements" "$rules" "elements"
 lacks "无转发不生成 DNAT"       "$rules" "dnat"
 
+mkdir "$WORK/preview"
+ok "print-rules 不需要 root 或 nft" env \
+    NFT_SH_WHITELIST_FILE="$WORK/preview/whitelist" \
+    NFT_SH_FORWARD_FILE="$WORK/preview/forward" \
+    NFT_SH_ENABLED_FILE="$WORK/preview/enabled" \
+    bash "$ROOT/nft.sh" print-rules
+eq "规则预览不创建配置文件" "0" "$(find "$WORK/preview" -type f | wc -l | tr -d ' ')"
+rm -f "$NFT_SH_ENABLED_FILE"
+ok "未初始化时白名单默认启用" is_whitelist_enabled
+
 # ---------------------------------------------------------------- 快照与确认判断
 echo 1 > "$NFT_SH_ENABLED_FILE"
 printf '1.2.3.4\n5.6.7.8\n' > "$NFT_SH_WHITELIST_FILE"
@@ -292,6 +307,14 @@ INTERACTIVE=0
 no "非交互时不提问"           needs_confirmation
 end_action
 no "快照目录已清理"           test -d "$snap"
+
+rm -f "$NFT_SH_WHITELIST_FILE"
+begin_action
+printf '1.2.3.4\n' > "$NFT_SH_WHITELIST_FILE"
+restore_config_files "$SNAPSHOT_DIR"
+no "恢复快照会删除原本不存在的配置" test -e "$NFT_SH_WHITELIST_FILE"
+end_action
+: > "$NFT_SH_WHITELIST_FILE"
 
 # ---------------------------------------------------------------- 非交互时拒绝危险操作
 no "非交互默认拒绝"           confirm_danger "继续?"
@@ -419,6 +442,142 @@ eq "白名单开关已关闭"                 "0" "$(cat "$NFT_SH_ENABLED_FILE")
 has "关闭后 input 放行"               "$(cat "$NFT_PERSIST_FILE")" "policy accept;"
 no "命令行缺少参数"                   run_cli add-ip
 no "命令行未知命令"                   run_cli no-such-command
+no "白名单命令拒绝多余参数"           run_cli whitelist off extra
+
+# 重新应用 / 导入不能绕过 SSH 端口和重叠检查（FORCE 也不允许抢占 SSH）。
+printf '2222|192.0.2.10|80\n' > "$NFT_SH_FORWARD_FILE"
+export SSH_CONNECTION='203.0.113.7 50000 10.0.0.1 2222' NFT_SH_FORCE=1
+: > "$FAKE_NFT_STATE/calls"
+no "重新应用拒绝配置中的 SSH 转发"    run_cli apply
+lacks "拒绝 SSH 转发时不加载规则"     "$(cat "$FAKE_NFT_STATE/calls")" "-f "
+unset SSH_CONNECTION NFT_SH_FORCE
+printf '10000-10002|192.0.2.10|20000-20002\n10001|192.0.2.11|80\n' > "$NFT_SH_FORWARD_FILE"
+no "重新应用拒绝重叠的转发配置"       run_cli apply
+: > "$NFT_SH_FORWARD_FILE"
+
+saved_ensure=$(declare -f ensure_ip_forward)
+ensure_ip_forward() { return 1; }
+: > "$FAKE_NFT_STATE/calls"
+no "开启 IP 转发失败时添加命令失败"   run_cli add-forward 8080 192.0.2.10 80
+eq "开启 IP 转发失败不保存转发"       "" "$(cat "$NFT_SH_FORWARD_FILE")"
+lacks "开启 IP 转发失败不加载规则"    "$(cat "$FAKE_NFT_STATE/calls")" "-f "
+eval "$saved_ensure"
+
+# 持久化失败必须可见，替换失败不能截断上次可用的文件。
+cp "$NFT_PERSIST_FILE" "$WORK/persist.before"
+mv() { return 1; }
+no "持久化替换失败返回错误"           persist_rules "$FAKE_NFT_STATE/last.nft"
+unset -f mv
+ok "替换失败保留旧持久化文件"         cmp -s "$WORK/persist.before" "$NFT_PERSIST_FILE"
+saved_persist="$NFT_PERSIST_FILE"
+mkdir "$WORK/persist-directory"
+NFT_PERSIST_FILE="$WORK/persist-directory"
+if out=$(run_cli apply 2>&1); then rc=0; else rc=$?; fi
+eq "应用时持久化失败返回非零"         "1" "$rc"
+lacks "持久化失败不显示应用成功"      "$out" "✓ 规则已应用"
+eq "持久化目标为目录时不把临时文件移入" "0" "$(find "$NFT_PERSIST_FILE" -type f | wc -l | tr -d ' ')"
+NFT_PERSIST_FILE="$saved_persist"
+mkdir "$WORK/conf-directory"
+detect_nft_main_conf() { echo "$WORK/conf-directory"; }
+no "主配置无法写入时持久化失败"       persist_rules "$FAKE_NFT_STATE/last.nft"
+detect_nft_main_conf() { echo "$WORK/nftables.conf"; }
+
+printf '#!/bin/bash\nexit 1\n' > "$FAKE_BIN/cp"
+chmod +x "$FAKE_BIN/cp"
+hash -r
+no "快照失败时拒绝修改配置"           run_cli add-ip 198.51.100.99
+rm -f "$FAKE_BIN/cp"
+hash -r
+no "快照失败没有添加新 IP"            grep -qF '198.51.100.99' "$NFT_SH_WHITELIST_FILE"
+
+# 后台保护不可用时必须在 nft 加载前退出。
+saved_schedule=$(declare -f schedule_rollback_guard)
+schedule_rollback_guard() { return 1; }
+INTERACTIVE=1
+begin_action
+CONFIRM_ALWAYS=1
+echo 1 > "$NFT_SH_ENABLED_FILE"
+: > "$FAKE_NFT_STATE/calls"
+no "后台保护无法启动时拒绝应用"       apply_all_rules
+lacks "后台保护失败时未加载规则"      "$(cat "$FAKE_NFT_STATE/calls")" "-f "
+end_action
+eval "$saved_schedule"
+
+# 确认、拒绝、真正的 read 超时、后台超时与迟到的确认。
+begin_action
+ok "输入 y 确认"                     confirm_or_rollback <<< y
+ok "确认标记已写入"                  test -e "$SNAPSHOT_DIR/confirmed"
+end_action
+begin_action
+wl_add 198.51.100.9 >/dev/null
+no "输入 n 回滚"                     confirm_or_rollback <<< n
+no "拒绝后配置已恢复"                grep -qF '198.51.100.9' "$NFT_SH_WHITELIST_FILE"
+end_action
+begin_action
+wl_add 198.51.100.9 >/dev/null
+ROLLBACK_TIMEOUT=1
+no "未按回车的 y 超时仍回滚"         confirm_or_rollback < <(printf y; sleep 2)
+no "超时后配置已恢复"                grep -qF '198.51.100.9' "$NFT_SH_WHITELIST_FILE"
+end_action
+ROLLBACK_TIMEOUT=60
+begin_action
+wl_add 198.51.100.9 >/dev/null
+snap="$SNAPSHOT_DIR"
+rollback_guard "$snap" 0
+no "后台回滚恢复配置"                grep -qF '198.51.100.9' "$NFT_SH_WHITELIST_FILE"
+no "后台回滚后清理快照"              test -d "$snap"
+no "后台回滚后的 y 不能算确认成功"   confirm_or_rollback <<< y
+end_action
+INTERACTIVE=0
+
+# 安全读取归档成员：只接受唯一的普通文件，完全不展开路径和链接。
+mkdir -p "$WORK/archive/directory"
+printf 'payload\n' > "$WORK/archive/member"
+tar -czf "$WORK/member.tar.gz" -C "$WORK/archive" member
+ok "读取普通归档成员"                read_backup_member "$WORK/member.tar.gz" member "$WORK/member.out"
+eq "归档成员内容"                    "payload" "$(cat "$WORK/member.out")"
+tar -czf "$WORK/duplicate.tar.gz" -C "$WORK/archive" member member
+no "拒绝同名的多个归档成员"          read_backup_member "$WORK/duplicate.tar.gz" member "$WORK/member.out"
+tar -czf "$WORK/directory.tar.gz" -C "$WORK/archive" directory
+no "拒绝把归档目录当作配置文件"      read_backup_member "$WORK/directory.tar.gz" directory "$WORK/member.out"
+if [ "$(uname -s)" = Linux ]; then
+    ln -s "$NFT_SH_WHITELIST_FILE" "$WORK/archive/link"
+    tar -czf "$WORK/link.tar.gz" -C "$WORK/archive" link
+    no "拒绝归档符号链接"            read_backup_member "$WORK/link.tar.gz" link "$WORK/member.out"
+    ln "$WORK/archive/member" "$WORK/archive/hardlink"
+    tar -czf "$WORK/hardlink.tar.gz" -C "$WORK/archive" member hardlink
+    no "拒绝归档硬链接"              read_backup_member "$WORK/hardlink.tar.gz" hardlink "$WORK/member.out"
+fi
+
+# 使用旧版本相同的归档路径，验证正常导入和 SSH 防护。
+printf '203.0.113.7\n' > "$NFT_SH_WHITELIST_FILE"
+printf '8080|192.0.2.10|80\n' > "$NFT_SH_FORWARD_FILE"
+echo 0 > "$NFT_SH_ENABLED_FILE"
+tar -czf "$WORK/backup.tar.gz" -C / "${NFT_SH_WHITELIST_FILE#/}" "${NFT_SH_FORWARD_FILE#/}" "${NFT_SH_ENABLED_FILE#/}"
+: > "$NFT_SH_FORWARD_FILE"
+begin_action
+ok "导入正常的旧格式备份"            import_config <<< "$WORK/backup.tar.gz"
+end_action
+eq "备份中的转发已恢复"              '8080|192.0.2.10|80' "$(cat "$NFT_SH_FORWARD_FILE")"
+printf '2222|192.0.2.10|80\n' > "$NFT_SH_FORWARD_FILE"
+tar -czf "$WORK/ssh-backup.tar.gz" -C / "${NFT_SH_FORWARD_FILE#/}"
+printf '8080|192.0.2.10|80\n' > "$NFT_SH_FORWARD_FILE"
+export SSH_CONNECTION='203.0.113.7 50000 10.0.0.1 2222'
+begin_action
+no "导入备份不能抢占 SSH 端口"       import_config <<< "$WORK/ssh-backup.tar.gz"
+end_action
+eq "导入被拒绝后原配置保留"          '8080|192.0.2.10|80' "$(cat "$NFT_SH_FORWARD_FILE")"
+unset SSH_CONNECTION
+printf 'invalid\n' > "$NFT_SH_ENABLED_FILE"
+printf '198.51.100.55\n' > "$NFT_SH_WHITELIST_FILE"
+tar -czf "$WORK/bad-flag.tar.gz" -C / "${NFT_SH_WHITELIST_FILE#/}" "${NFT_SH_ENABLED_FILE#/}"
+printf '203.0.113.7\n' > "$NFT_SH_WHITELIST_FILE"
+echo 1 > "$NFT_SH_ENABLED_FILE"
+begin_action
+no "导入无效白名单开关时拒绝整份备份" import_config <<< "$WORK/bad-flag.tar.gz"
+end_action
+eq "无效开关不会关闭白名单"          "1" "$(cat "$NFT_SH_ENABLED_FILE")"
+eq "无效备份不会部分覆盖白名单"      '203.0.113.7' "$(cat "$NFT_SH_WHITELIST_FILE")"
 CLI_MODE=0
 
 echo ""

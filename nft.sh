@@ -390,7 +390,7 @@ init_files() {
 # 获取白名单开关状态
 is_whitelist_enabled() {
     local file="${1:-$WHITELIST_ENABLED_FILE}"
-    [ -f "$file" ] && [ "$(trim "$(head -n 1 "$file")")" = "1" ]
+    [ ! -f "$file" ] || [ "$(trim "$(head -n 1 "$file")")" = "1" ]
 }
 
 # 读取白名单原始条目（去掉空行、注释和首尾空白；末尾没有换行的最后一行也能读到）
@@ -438,10 +438,11 @@ parse_forward_line() {
     line=$(trim "$1")
     [ -z "$line" ] && return 1
     [[ "$line" == \#* ]] && return 1
+    [[ "$line" =~ ^[^\|]+\|[^\|]+\|[^\|]+$ ]] || return 1
     IFS='|' read -r lp tip tp extra <<< "$line"
     [ -z "$extra" ] || return 1
     tip=$(trim "$tip")
-    is_valid_ipv4 "$tip" || return 1
+    validate_target_ip "$tip" >/dev/null || return 1
     l=$(parse_port_spec "$lp") || return 1
     t=$(parse_port_spec "$tp") || return 1
     read -r ls le <<< "$l"
@@ -678,7 +679,7 @@ remove_snapshot_dir() {
 
 # 记录操作前的状态：三个配置文件 + 当前生效的 unified 表
 begin_action() {
-    local i=0 f
+    local i=0 f t
     end_action
     CONFIRM_ALWAYS=0
     SNAPSHOT_DIR=$(mktemp -d "${TMPDIR:-/tmp}/nft-sh.XXXXXX") || {
@@ -687,25 +688,31 @@ begin_action() {
     }
     for f in "$WHITELIST_FILE" "$FORWARD_FILE" "$WHITELIST_ENABLED_FILE"; do
         i=$((i + 1))
-        printf '%s\n' "$f" > "$SNAPSHOT_DIR/cfg.$i.path"
+        printf '%s\n' "$f" > "$SNAPSHOT_DIR/cfg.$i.path" || { end_action; return 1; }
         if [ -f "$f" ]; then
-            cp -p "$f" "$SNAPSHOT_DIR/cfg.$i"
+            cp -p "$f" "$SNAPSHOT_DIR/cfg.$i" || { end_action; return 1; }
         else
             : > "$SNAPSHOT_DIR/cfg.$i"
+            : > "$SNAPSHOT_DIR/cfg.$i.missing"
         fi
     done
     {
-        echo "add table inet $NFT_TABLE"
-        echo "delete table inet $NFT_TABLE"
-        if nft list table inet "$NFT_TABLE" 2>/dev/null; then
-            : > "$SNAPSHOT_DIR/had_table"
-        fi
+        for t in "$NFT_TABLE" "${LEGACY_TABLES[@]}"; do
+            echo "add table inet $t"
+            echo "delete table inet $t"
+            if nft list table inet "$t" 2>/dev/null; then
+                [ "$t" != "$NFT_TABLE" ] || : > "$SNAPSHOT_DIR/had_table"
+            fi
+        done
     } > "$SNAPSHOT_DIR/live.nft"
 }
 
 end_action() {
-    if [ -n "$SNAPSHOT_DIR" ] && [ "$ROLLBACK_PENDING" -ne 1 ]; then
-        remove_snapshot_dir "$SNAPSHOT_DIR"
+    if [ -n "$SNAPSHOT_DIR" ]; then
+        if [ "$ROLLBACK_PENDING" -ne 1 ] ||
+            { [ -e "$SNAPSHOT_DIR/completed" ] && [ -e "$SNAPSHOT_DIR/guard_finished" ]; }; then
+            remove_snapshot_dir "$SNAPSHOT_DIR"
+        fi
     fi
     SNAPSHOT_DIR=""
     ROLLBACK_PENDING=0
@@ -713,12 +720,19 @@ end_action() {
 
 # 把配置文件恢复成快照里的内容
 restore_config_files() {
-    local snap="$1" p target
+    local snap="$1" p target rc=0
+    [ -n "$snap" ] && [ -d "$snap" ] || return 1
     for p in "$snap"/cfg.*.path; do
         [ -f "$p" ] || continue
         target=$(head -n 1 "$p")
-        [ -n "$target" ] && cat "${p%.path}" > "$target"
+        [ -n "$target" ] || continue
+        if [ -e "${p%.path}.missing" ]; then
+            rm -f -- "$target" || rc=1
+        else
+            cat "${p%.path}" > "$target" || rc=1
+        fi
     done
+    return "$rc"
 }
 
 # 恢复快照：实时规则 + 配置文件。旧规则恢复失败时删除本脚本的表，保证不会把人锁在外面
@@ -728,7 +742,7 @@ restore_snapshot() {
         nft delete table inet "$NFT_TABLE" 2>/dev/null
         rc=1
     fi
-    restore_config_files "$snap"
+    restore_config_files "$snap" || rc=1
     return $rc
 }
 
@@ -738,7 +752,9 @@ schedule_rollback_guard() {
     if [ ! -f "$SCRIPT_PATH" ] || ! cp -f "$SCRIPT_PATH" "$self" 2>/dev/null || [ ! -s "$self" ]; then
         return 1
     fi
+    # systemd-run 默认回到宿主机的网络命名空间；隔离环境中必须使用 setsid 保留当前空间。
     if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ] &&
+        [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] &&
         systemd-run --quiet --unit="nft-sh-rollback-$$-$RANDOM" --on-active="$delay" \
             /bin/bash "$self" __rollback_guard "$snap" 0 >/dev/null 2>&1; then
         return 0
@@ -761,14 +777,19 @@ rollback_guard() {
     if [[ "$delay" =~ ^[0-9]+$ ]] && [ "$delay" -gt 0 ]; then
         sleep "$delay"
     fi
-    if [ ! -e "$snap/confirmed" ] && [ ! -e "$snap/rolled_back" ]; then
+    [ -d "$snap" ] || return 0
+    # 和前台的确认 / 回滚互斥，避免临近超时时重复恢复或误报确认成功。
+    if mkdir "$snap/decision" 2>/dev/null; then
         : > "$snap/rolled_back"
         restore_snapshot "$snap"
+        : > "$snap/completed"
         if command -v logger >/dev/null 2>&1; then
             logger -t nft.sh "change was not confirmed in time, firewall rules rolled back"
         fi
     fi
-    remove_snapshot_dir "$snap"
+    : > "$snap/guard_finished"
+    # 前台可能仍在恢复或持久化；由最后完成的一方清理快照。
+    [ ! -e "$snap/completed" ] || remove_snapshot_dir "$snap"
 }
 
 # 本次操作是否删除了白名单条目
@@ -795,11 +816,6 @@ needs_confirmation() {
 # 规则已生效后等待确认，超时或拒绝则回滚
 confirm_or_rollback() {
     local snap="$SNAPSHOT_DIR" ans="" answered=0
-    if schedule_rollback_guard "$snap" $((ROLLBACK_TIMEOUT + 5)); then
-        ROLLBACK_PENDING=1
-    else
-        warn "（无法创建后台回滚任务：如果当前 SSH 连接意外断开，规则不会自动回滚）"
-    fi
     echo ""
     warn "规则已生效。请不要关闭当前窗口，另开一个 SSH 窗口测试能否正常登录。"
     echo -ne "${YELLOW}确认正常请在 ${ROLLBACK_TIMEOUT} 秒内输入 y 并回车，超时或输入其他内容将自动回滚: ${NC}"
@@ -809,9 +825,13 @@ confirm_or_rollback() {
     else
         echo ""
     fi
-    if [ "$answered" -eq 1 ] && [[ "$ans" =~ ^[Yy]$ ]] && [ ! -e "$snap/rolled_back" ]; then
+    if [ "$answered" -eq 1 ] && [[ "$ans" =~ ^[Yy]$ ]] && mkdir "$snap/decision" 2>/dev/null; then
         : > "$snap/confirmed"
         return 0
+    fi
+    if ! mkdir "$snap/decision" 2>/dev/null; then
+        warn "后台回滚已开始，本次修改未确认"
+        return 1
     fi
     : > "$snap/rolled_back"
     if restore_snapshot "$snap"; then
@@ -819,6 +839,7 @@ confirm_or_rollback() {
     else
         error "恢复旧规则失败，已删除本脚本的防火墙表以保证可以登录，请检查后重新应用规则"
     fi
+    : > "$snap/completed"
     return 1
 }
 
@@ -837,19 +858,31 @@ detect_nft_main_conf() {
 }
 
 persist_rules() {
-    local rules="$1" conf
-    if ! mkdir -p "$NFT_PERSIST_DIR" || ! cat "$rules" > "$NFT_PERSIST_FILE"; then
+    local rules="$1" conf tmp
+    if ! mkdir -p "$NFT_PERSIST_DIR"; then
+        error "✗ 创建 $NFT_PERSIST_DIR 失败"
+        return 1
+    fi
+    tmp=$(mktemp "$NFT_PERSIST_DIR/.unified.XXXXXX") || return 1
+    if ! cat "$rules" > "$tmp" || ! chmod 644 "$tmp" || ! mv -fT -- "$tmp" "$NFT_PERSIST_FILE"; then
+        rm -f -- "$tmp"
         error "✗ 写入 $NFT_PERSIST_FILE 失败，规则在重启后不会保留"
         return 1
     fi
     conf=$(detect_nft_main_conf)
     if [ -f "$conf" ]; then
         if ! grep -qxF "$NFT_INCLUDE_LINE" "$conf"; then
-            append_line "$conf" "$NFT_INCLUDE_LINE"
+            if ! append_line "$conf" "$NFT_INCLUDE_LINE"; then
+                error "✗ 写入 $conf 失败，无法设置开机加载"
+                return 1
+            fi
         fi
     else
-        mkdir -p "$(dirname "$conf")"
-        printf '#!/usr/sbin/nft -f\n%s\n' "$NFT_INCLUDE_LINE" > "$conf"
+        if ! mkdir -p "$(dirname "$conf")" ||
+            ! printf '#!/usr/sbin/nft -f\n%s\n' "$NFT_INCLUDE_LINE" > "$conf"; then
+            error "✗ 写入 $conf 失败，无法设置开机加载"
+            return 1
+        fi
     fi
     if command -v systemctl >/dev/null 2>&1; then
         if ! systemctl enable nftables >/dev/null 2>&1; then
@@ -911,39 +944,87 @@ ip_forward_enabled() {
     [ "$(cat /proc/sys/net/ipv4/ip_forward 2>/dev/null)" = "1" ]
 }
 
+# 对重新应用和导入的配置同样检查 SSH 端口和重复范围，不能只在添加时校验。
+precheck_forwards() {
+    local ls le tip ts te p i ports
+    local -a starts=() ends=()
+    ports=$(get_ssh_ports)
+    while read -r ls le tip ts te; do
+        for p in $ports; do
+            if [ "$p" -ge "$ls" ] && [ "$p" -le "$le" ]; then
+                error "错误: 转发配置包含 SSH 端口 $p，已拒绝应用"
+                return 1
+            fi
+        done
+        for i in "${!starts[@]}"; do
+            if [ "$ls" -le "${ends[i]}" ] && [ "$le" -ge "${starts[i]}" ]; then
+                error "错误: 转发配置中的本地端口范围重叠: $(port_spec "$ls" "$le")"
+                return 1
+            fi
+        done
+        starts+=("$ls"); ends+=("$le")
+    done < <(list_forwards)
+    return 0
+}
+
 # 应用完整规则（原子操作），成功后写入持久化配置
 apply_all_rules() {
-    local rules live err wl_count fw_count
+    local rules live err wl_count fw_count confirm=0
     echo -e "${YELLOW}正在应用防火墙和转发规则...${NC}"
 
-    if ! precheck_lockout; then
+    if ! precheck_forwards || ! precheck_lockout; then
         [ -n "$SNAPSHOT_DIR" ] && restore_config_files "$SNAPSHOT_DIR"
         warn "已取消，配置和防火墙规则都没有改动"
         return 1
     fi
 
-    rules=$(mktemp) || return 1
-    live=$(mktemp) || { rm -f "$rules"; return 1; }
-    build_ruleset > "$rules"
-    { legacy_table_deletes; cat "$rules"; } > "$live"
+    rules=$(mktemp) || { restore_config_files "$SNAPSHOT_DIR"; return 1; }
+    live=$(mktemp) || { rm -f "$rules"; restore_config_files "$SNAPSHOT_DIR"; return 1; }
+    if ! build_ruleset > "$rules" || ! { legacy_table_deletes; cat "$rules"; } > "$live"; then
+        rm -f "$rules" "$live"
+        restore_config_files "$SNAPSHOT_DIR"
+        return 1
+    fi
+
+    # 先安排独立的回滚任务，再加载规则；保护程序无法启动时不冒险应用。
+    if needs_confirmation; then
+        if ! schedule_rollback_guard "$SNAPSHOT_DIR" $((ROLLBACK_TIMEOUT + 5)); then
+            error "无法创建后台回滚任务，已取消应用"
+            restore_config_files "$SNAPSHOT_DIR"
+            rm -f "$rules" "$live"
+            return 1
+        fi
+        ROLLBACK_PENDING=1
+        confirm=1
+    fi
 
     if ! err=$(nft -f "$live" 2>&1); then
         error "✗ 规则应用失败，防火墙保持原样，没有做任何改动。nft 输出:"
         printf '%s\n' "$err" | head -n 20
         if [ -n "$SNAPSHOT_DIR" ]; then
             restore_config_files "$SNAPSHOT_DIR"
+            if [ "$ROLLBACK_PENDING" -eq 1 ]; then
+                mkdir "$SNAPSHOT_DIR/decision" 2>/dev/null && : > "$SNAPSHOT_DIR/confirmed"
+                : > "$SNAPSHOT_DIR/completed"
+            fi
             warn "配置文件已恢复为修改前的内容"
         fi
         rm -f "$rules" "$live"
         return 1
     fi
 
-    if needs_confirmation && ! confirm_or_rollback; then
+    if [ "$confirm" -eq 1 ] && ! confirm_or_rollback; then
         rm -f "$rules" "$live"
         return 1
     fi
 
-    persist_rules "$rules"
+    if ! persist_rules "$rules"; then
+        warn "规则已在内存中生效，但持久化失败，请修复文件路径或权限后重新 apply"
+        rm -f "$rules" "$live"
+        [ "$ROLLBACK_PENDING" -ne 1 ] || : > "$SNAPSHOT_DIR/completed"
+        return 1
+    fi
+    [ "$ROLLBACK_PENDING" -ne 1 ] || : > "$SNAPSHOT_DIR/completed"
     rm -f "$rules" "$live"
 
     wl_count=$(load_whitelist_normalized 2>/dev/null | wc -l)
@@ -977,7 +1058,7 @@ wl_add() {
             return 1
         fi
     done < <(load_whitelist_normalized 2>/dev/null)
-    append_line "$WHITELIST_FILE" "$entry"
+    append_line "$WHITELIST_FILE" "$entry" || return 1
     if [ "$entry" != "$raw" ]; then
         info "✓ 已添加: $entry（已规范化，原输入 $raw）"
     else
@@ -1004,7 +1085,10 @@ wl_remove() {
         error "白名单中不存在: $target"
         return 1
     fi
-    cat "$tmp" > "$WHITELIST_FILE"
+    if ! cat "$tmp" > "$WHITELIST_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
     info "✓ 已删除: $target"
 }
@@ -1158,7 +1242,7 @@ fwd_append() {
     local lspec tspec
     lspec=$(port_spec "$FWD_LS" "$FWD_LE")
     tspec=$(port_spec "$FWD_TS" "$FWD_TE")
-    append_line "$FORWARD_FILE" "$lspec|$FWD_TIP|$tspec"
+    append_line "$FORWARD_FILE" "$lspec|$FWD_TIP|$tspec" || return 1
     info "✓ 已添加转发: 本地 $lspec → $FWD_TIP:$tspec [TCP+UDP]"
 }
 
@@ -1181,7 +1265,10 @@ fwd_remove_index() {
         error "无效序号"
         return 1
     fi
-    cat "$tmp" > "$FORWARD_FILE"
+    if ! cat "$tmp" > "$FORWARD_FILE"; then
+        rm -f "$tmp"
+        return 1
+    fi
     rm -f "$tmp"
     info "✓ 已删除转发: $removed"
 }
@@ -1222,8 +1309,10 @@ fwd_confirm_and_apply() {
     echo -ne "确认? [Y/n]: "
     read -r confirm
     [[ "$confirm" =~ ^[Nn]$ ]] && return 0
-    fwd_append
-    ensure_ip_forward
+    if ! ensure_ip_forward || ! fwd_append; then
+        restore_config_files "$SNAPSHOT_DIR"
+        return 1
+    fi
     apply_all_rules
 }
 
@@ -1367,10 +1456,19 @@ export_config() {
     fi
 }
 
+# 从备份中读取一个普通文件到固定临时文件。只向 stdout 解压，归档中的链接、目录和
+# 路径都不会交给 tar 写入文件系统；同名成员出现多次也拒绝，避免内容被拼接。
+read_backup_member() {
+    local archive="$1" member="$2" dest="$3" listing
+    listing=$(tar -tvzf "$archive" --no-recursion -- "$member" 2>/dev/null) || return 1
+    [[ "$listing" == -* && "$listing" != *$'\n'* ]] || return 1
+    tar -xOzf "$archive" --no-recursion -- "$member" > "$dest" 2>/dev/null
+}
+
 # 导入配置：只读取本脚本的三个配置文件，内容逐条校验后再写入
 import_config() {
     local backup_file tmpd src total valid found=0 wl_ok=0 wl_bad=0 fw_ok=0 fw_bad=0
-    local ls le tip ts te
+    local ls le tip ts te flag name target
     echo -ne "备份文件路径: "
     read -r backup_file
     backup_file=$(trim "$backup_file")
@@ -1379,46 +1477,60 @@ import_config() {
         return 1
     fi
     tmpd=$(mktemp -d) || return 1
-    # 只解出这三个文件，压缩包里的其他内容一律忽略（防止覆盖系统文件）。
-    # 缺少其中某个文件时 tar 会报错，但其余文件仍会解出，所以不检查返回值
-    tar -xzf "$backup_file" -C "$tmpd" \
-        "${WHITELIST_FILE#/}" "${FORWARD_FILE#/}" "${WHITELIST_ENABLED_FILE#/}" 2>/dev/null
-
-    src="$tmpd/${WHITELIST_FILE#/}"
-    if [ -f "$src" ] && [ ! -L "$src" ]; then
+    src="$tmpd/whitelist"
+    if read_backup_member "$backup_file" "${WHITELIST_FILE#/}" "$src"; then
         found=1
         total=$(load_whitelist "$src" | wc -l)
-        load_whitelist_normalized "$src" 2>/dev/null | awk '!seen[$0]++' > "$WHITELIST_FILE"
+        load_whitelist_normalized "$src" 2>/dev/null | awk '!seen[$0]++' > "$tmpd/whitelist.valid"
         valid=$(load_whitelist_normalized "$src" 2>/dev/null | wc -l)
-        wl_ok=$(load_whitelist | wc -l)
+        wl_ok=$(load_whitelist "$tmpd/whitelist.valid" | wc -l)
         wl_bad=$((total - valid))
     fi
 
-    src="$tmpd/${FORWARD_FILE#/}"
-    if [ -f "$src" ] && [ ! -L "$src" ]; then
+    src="$tmpd/forward"
+    if read_backup_member "$backup_file" "${FORWARD_FILE#/}" "$src"; then
         found=1
         list_forwards "$src" | while read -r ls le tip ts te; do
             echo "$(port_spec "$ls" "$le")|$tip|$(port_spec "$ts" "$te")"
-        done > "$FORWARD_FILE"
-        fw_ok=$(list_forwards | wc -l)
+        done > "$tmpd/forward.valid"
+        fw_ok=$(list_forwards "$tmpd/forward.valid" | wc -l)
         fw_bad=$(invalid_forward_lines "$src" | wc -l)
     fi
 
-    src="$tmpd/${WHITELIST_ENABLED_FILE#/}"
-    if [ -f "$src" ] && [ ! -L "$src" ]; then
+    src="$tmpd/enabled"
+    if read_backup_member "$backup_file" "${WHITELIST_ENABLED_FILE#/}" "$src"; then
         found=1
-        if is_whitelist_enabled "$src"; then
-            echo "1" > "$WHITELIST_ENABLED_FILE"
-        else
-            echo "0" > "$WHITELIST_ENABLED_FILE"
-        fi
+        flag=$(trim "$(cat "$src")")
+        case "$flag" in
+            0|1) printf '%s\n' "$flag" > "$tmpd/enabled.valid" ;;
+            *)
+                error "备份中的白名单开关无效（只能是 0 或 1），已取消导入"
+                rm -rf "$tmpd"
+                return 1
+                ;;
+        esac
     fi
-    rm -rf "$tmpd"
 
     if [ "$found" -eq 0 ]; then
         error "备份文件中没有本脚本的配置（需要使用菜单 11 导出的 .tar.gz 文件）"
+        rm -rf "$tmpd"
         return 1
     fi
+    for name in whitelist forward enabled; do
+        [ -f "$tmpd/$name.valid" ] || continue
+        case "$name" in
+            whitelist) target="$WHITELIST_FILE" ;;
+            forward) target="$FORWARD_FILE" ;;
+            enabled) target="$WHITELIST_ENABLED_FILE" ;;
+        esac
+        if ! cat "$tmpd/$name.valid" > "$target"; then
+            error "写入 $target 失败，已取消导入"
+            restore_config_files "$SNAPSHOT_DIR"
+            rm -rf "$tmpd"
+            return 1
+        fi
+    done
+    rm -rf "$tmpd"
     info "已读取备份: 白名单 ${wl_ok} 条，转发 ${fw_ok} 条"
     if [ $((wl_bad + fw_bad)) -gt 0 ]; then
         warn "跳过了 ${wl_bad} 条无效白名单、${fw_bad} 条无效转发"
@@ -1548,7 +1660,12 @@ main_menu() {
 
         # 会修改配置或规则的操作，先记录快照，失败或超时可以恢复
         case "$choice" in
-            1|2|3|4|5|6|8|10|12) begin_action ;;
+            1|2|3|4|5|6|8|10|12)
+                if ! begin_action; then
+                    error "无法保存操作前的快照，已取消"
+                    continue
+                fi
+                ;;
         esac
 
         case "$choice" in
@@ -1654,7 +1771,7 @@ run_cli() {
             build_ruleset
             ;;
         apply)
-            begin_action
+            begin_action || return 1
             CONFIRM_ALWAYS=1
             apply_all_rules
             rc=$?
@@ -1664,7 +1781,7 @@ run_cli() {
                 usage >&2
                 return 2
             fi
-            begin_action
+            begin_action || return 1
             if [ "$cmd" = "add-ip" ]; then
                 wl_add "$1" && apply_all_rules
             else
@@ -1673,9 +1790,10 @@ run_cli() {
             rc=$?
             ;;
         whitelist)
+            [ $# -eq 1 ] || { usage >&2; return 2; }
             case "${1:-}" in
                 on|off)
-                    begin_action
+                    begin_action || return 1
                     if [ "$1" = "on" ]; then
                         echo "1" > "$WHITELIST_ENABLED_FILE"
                     else
@@ -1695,11 +1813,9 @@ run_cli() {
                 usage >&2
                 return 2
             fi
-            begin_action
+            begin_action || return 1
             if fwd_validate "$1" "$2" "$3"; then
-                fwd_append
-                ensure_ip_forward
-                apply_all_rules
+                ensure_ip_forward && fwd_append && apply_all_rules
                 rc=$?
             else
                 rc=1
@@ -1710,7 +1826,7 @@ run_cli() {
                 usage >&2
                 return 2
             fi
-            begin_action
+            begin_action || return 1
             if idx=$(fwd_index_by_local "$1"); then
                 fwd_remove_index "$idx" && apply_all_rules
                 rc=$?
@@ -1751,6 +1867,12 @@ main() {
             exit 0
             ;;
     esac
+
+    # 规则预览只读取已有配置，不要求 root/nft，也不初始化任何文件。
+    if [ "${1:-}" = "print-rules" ]; then
+        build_ruleset
+        exit $?
+    fi
 
     if [ "$EUID" -ne 0 ]; then
         error "错误: 请使用root权限运行（例如: sudo bash $0）"
