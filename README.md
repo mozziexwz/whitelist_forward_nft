@@ -2,7 +2,7 @@
 
 懒人一键脚本：基于 nftables 的 **IP 白名单防火墙 + 端口转发（TCP+UDP）**，适合用 VPS 做中转。
 
-当前分支为 **v2.1.0 开发版本**，包含下述 IPv6 / 内核跨族转发；已发布的 v2.0.0 仍只支持 IPv4→IPv4。新增功能请使用当前分支检出的 `nft.sh`。
+主分支代码为 **v2.1.0**，包含下述 IPv6 / 内核跨族转发。新增功能请下载 `main` 的 `nft.sh`；已发布的 v2.0.0 Release 仍只支持 IPv4→IPv4，v2.1.0 尚未单独创建 Release。
 
 ## 功能
 
@@ -68,20 +68,14 @@ sudo bash nft.sh install-jool
 
 ## 安装与运行
 
-测试本分支新增 IPv6 功能：
+下载主分支代码（包含 IPv6 与内核跨族转发）：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/codex/ipv6-kernel-forwarding/nft.sh -o nft.sh
+curl -fL https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/main/nft.sh -o nft.sh
 sudo bash nft.sh
 ```
 
-快速运行（main 分支，尚无本分支新增功能）：
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/main/nft.sh && bash nft.sh
-```
-
-推荐：下载 [v2.0.0 正式版](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.0.0)，核对随版本发布的 SHA256 后再运行：
+需要旧版（仅 IPv4→IPv4）时，可下载 [v2.0.0 正式版](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.0.0)，核对随版本发布的 SHA256 后再运行：
 
 ```bash
 curl -fsSLO https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.0.0/nft.sh
@@ -197,6 +191,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 - **Docker 容器访问不了宿主机上的服务？** 白名单启用时，容器发往宿主机的连接同样要经过白名单，把容器网段加入白名单即可，例如 `bash nft.sh add-ip 172.16.0.0/12`。容器访问外网不受影响；Docker 映射出来的端口同样受白名单保护。
 - **系统里还有其他 nftables 表？** `nft.sh status` 会列出它们。那些表里的规则会和本脚本同时生效，本脚本不会修改它们。
 - **公网 IP 经常变化？** 可以把运营商的整个网段加入白名单，例如 `1.2.3.0/24`。
+- **IPv4 转发通，IPv6 转发不通？** 白名单按地址族分别匹配。白名单开启但 IPv6 集合为空时，新的 IPv6 转发连接会被拒绝；请在菜单 1 添加测试客户端实际使用的 IPv6 地址或自己控制的网段。此处填写客户端来源，而非 VPS 自身 IPv6。
 - **从旧版本升级？** 旧三字段规则继续有效，替换脚本后在菜单里选择 8 重新应用规则。新增 IPv6 条目使用四字段，降级前需撤销跨族资源并恢复旧配置。旧版可能删除 `inet filter` 表，本版本只清理项目自己的表。
 
 ## 开发与测试
@@ -219,13 +214,13 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 - `sudo bash tests/kernel_systemd_test.sh`：需要 Jool；强制终止首次自定义部署，验证 systemd 在未继承 shell 环境时恢复正确的内核资源与文件
 - `sudo bash tests/coexistence_test.sh`：需要 Docker 和 `wireguard-tools`；验证真实容器映射、容器出站和两个 WireGuard 对等端，退出时清理测试资源
 - `tests/reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：真实重启前后验收；操作方法和已经通过的环境见 [验收记录](docs/VALIDATION.md)
-- `tests/kernel_reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：四方向跨族启动恢复，配合独立 VPS 上的 `tests/kernel_public_client.py`；操作方法、版本和本分支实测结果见 [IPv6 验收记录](docs/IPV6_VALIDATION.md)
+- `tests/kernel_reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：四方向跨族启动恢复，配合独立 VPS 上的 `tests/kernel_public_client.py`；操作方法、版本和实测结果见 [IPv6 验收记录](docs/IPV6_VALIDATION.md)
 
 前台确认等待 60 秒；独立后台保护约在 65 秒后尝试恢复。systemd 定时器使用 1 秒精度，SELinux 开启时通过标准输入读取回滚规则，无需关闭 SELinux。
 
 ## 更新说明
 
-### v2.1.0（功能分支，待合并发布）
+### v2.1.0（主分支代码，尚未创建 Release）
 
 - 新增 IPv6→IPv6、IPv6→IPv4、IPv4→IPv6 的 TCP/UDP 和端口段映射
 - 同族使用 nft，跨族使用专用 namespace 中的 Jool 内核转换，无常驻用户态中继
