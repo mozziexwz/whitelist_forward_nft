@@ -11,6 +11,11 @@ trap 'rm -rf -- "$WORK"' EXIT
 # shellcheck source=../nft.sh
 source "$ROOT/nft.sh"
 [ "$(jool_os_id)" = debian ] && [ "$(dpkg --print-architecture)" = amd64 ]
+# Bullseye security packages have moved to the official signed archive.
+# Only this disposable CI container's source is changed, never a user's VPS.
+if grep -q '^VERSION_ID="11"$' /etc/os-release; then
+    sed -i 's#deb.debian.org/debian-security#archive.debian.org/debian-security#g' /etc/apt/sources.list
+fi
 mkdir -p /run/lock
 bash "$ROOT/tests/unit_test.sh"
 bash "$ROOT/tests/jool_install_test.sh"
@@ -55,6 +60,8 @@ FORWARD_FILE="$WORK/forward.conf"
 WHITELIST_FILE="$WORK/whitelist"
 WHITELIST_ENABLED_FILE="$WORK/enabled"
 TRANSLATE_DIR="$WORK/translate"
+# Consumed by build_ruleset in the sourced runtime.
+# shellcheck disable=SC2034
 TRANSLATE_DEPLOY="$TRANSLATE_DIR/deployment.conf"
 printf '192.0.2.1\n2001:db8::1\n' > "$WHITELIST_FILE"
 echo 1 > "$WHITELIST_ENABLED_FILE"

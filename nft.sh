@@ -729,9 +729,12 @@ jool_install_platform() {
 }
 
 jool_kernel_headers_ready() {
-    local build="/lib/modules/$1/build"
-    [ -f "$build/Makefile" ] && [ -r "$build/include/config/kernel.release" ] &&
-        [ "$(cat "$build/include/config/kernel.release")" = "$1" ]
+    local build="${2:-/lib/modules/$1/build}" release
+    [ -f "$build/Makefile" ] && [ -r "$build/include/generated/utsrelease.h" ] || return 1
+    # Debian 11/12's kernel.release can contain the upstream source version;
+    # UTS_RELEASE is the ABI string used by the running kernel and vermagic.
+    release=$(awk -F '\042' '/^#define UTS_RELEASE / { print $2; exit }' "$build/include/generated/utsrelease.h")
+    [ "$release" = "$1" ]
 }
 
 jool_apt_candidate() {

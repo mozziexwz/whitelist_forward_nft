@@ -202,7 +202,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 ## 开发与测试
 
 - `bash tests/unit_test.sh`：纯 bash 单元测试，不需要 root，Windows 的 Git Bash 也能运行
-- `sudo bash tests/jool_install_test.sh`：31 项隔离依赖测试；验证缺项、版本冲突、下载/校验/DKMS/加载失败、部分/重复安装，以及 Debian 旧 headers 退役、已安装 headers 复用和内核类型建议，不安装系统软件
+- `sudo bash tests/jool_install_test.sh`：34 项隔离依赖测试；验证缺项、版本冲突、下载/校验/DKMS/加载失败、部分/重复安装，以及 Debian 旧 headers 退役、已安装 headers ABI 校验与复用和内核类型建议，不安装系统软件
 - `tests/debian_build_test.sh`：仅用于一次性 CI 容器；Debian 11/12/13 原生依赖和工具、cloud/普通两类内核 headers + DKMS 模块编译与版本检查，并用各版 nftables 检查四方向规则；不加载模块，不证明容器宿主之外的实际内核数据路径
 - `sudo bash tests/netns_test.sh`：在隔离的 network namespace 里真实加载规则，测试转发和白名单；不改动宿主机的防火墙、`/etc` 和 systemd 服务
 - `sudo bash tests/kernel_netns_test.sh`：需已安装匹配的 Jool 工具/模块，在隔离 network/mount namespace 中验证四方向 TCP/UDP、端口段、重复目标、白名单、绕过路径、大包及实例故障恢复

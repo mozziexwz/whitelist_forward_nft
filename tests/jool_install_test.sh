@@ -97,6 +97,24 @@ for scenario in missing-client missing-module old mismatch loaded-mismatch unloa
     expect "read-only dependency diagnostic: $scenario" diagnostic "$scenario"
 done
 
+headers_abi() (
+    local scenario="$1" dir="$WORK/abi-$1" rc
+    mkdir -p "$dir/include/generated" "$dir/include/config"
+    : > "$dir/Makefile"
+    echo 6.1.190 > "$dir/include/config/kernel.release"
+    printf '#define UTS_RELEASE "6.1.0-54-cloud-amd64"\n' > "$dir/include/generated/utsrelease.h"
+    case "$scenario" in
+        mismatch) printf '#define UTS_RELEASE "6.1.0-54-amd64"\n' > "$dir/include/generated/utsrelease.h" ;;
+        missing) rm "$dir/include/generated/utsrelease.h" ;;
+    esac
+    jool_kernel_headers_ready 6.1.0-54-cloud-amd64 "$dir"
+    rc=$?
+    case "$scenario" in matching) [ "$rc" -eq 0 ] ;; *) [ "$rc" -ne 0 ] ;; esac
+)
+for scenario in matching mismatch missing; do
+    expect "headers use ABI rather than upstream source version: $scenario" headers_abi "$scenario"
+done
+
 debian_headers() (
     local scenario="$1" kernel=6.1.0-42-cloud-amd64 rc
     CASE="$WORK/debian-$scenario"
