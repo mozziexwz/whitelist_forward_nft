@@ -53,6 +53,7 @@ done
 export NFT_SH_WHITELIST_FILE="$WORK/whitelist" NFT_SH_FORWARD_FILE="$WORK/forward"
 export NFT_SH_ENABLED_FILE="$WORK/enabled" NFT_SH_PERSIST_DIR="$WORK/nftables.d"
 export NFT_SH_MAIN_CONF="$WORK/nftables.conf" NFT_SH_SYSCTL_FILE="$WORK/sysctl.conf"
+export TMPDIR="$WORK"
 mkdir "$WORK/bin"
 printf '#!/bin/sh\nexit 0\n' > "$WORK/bin/systemctl"
 chmod +x "$WORK/bin/systemctl"
