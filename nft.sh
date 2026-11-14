@@ -738,7 +738,8 @@ restore_config_files() {
 # 恢复快照：实时规则 + 配置文件。旧规则恢复失败时删除本脚本的表，保证不会把人锁在外面
 restore_snapshot() {
     local snap="$1" rc=0
-    if ! nft -f "$snap/live.nft" 2>/dev/null; then
+    # RHEL 的 SELinux 域可能禁止 nft 直接读取 user_tmp_t；由 shell 读取后经管道传入。
+    if ! (set -o pipefail; cat "$snap/live.nft" | nft -f -) 2>/dev/null; then
         nft delete table inet "$NFT_TABLE" 2>/dev/null
         rc=1
     fi
@@ -755,7 +756,8 @@ schedule_rollback_guard() {
     # systemd-run 默认回到宿主机的网络命名空间；隔离环境中必须使用 setsid 保留当前空间。
     if command -v systemd-run >/dev/null 2>&1 && [ -d /run/systemd/system ] &&
         [ "$(readlink /proc/self/ns/net)" = "$(readlink /proc/1/ns/net)" ] &&
-        systemd-run --quiet --unit="nft-sh-rollback-$$-$RANDOM" --on-active="$delay" \
+        systemd-run --quiet --collect --unit="nft-sh-rollback-$$-$RANDOM" --on-active="$delay" \
+            --timer-property=AccuracySec=1s --timer-property=RemainAfterElapse=no \
             /bin/bash "$self" __rollback_guard "$snap" 0 >/dev/null 2>&1; then
         return 0
     fi
@@ -768,7 +770,7 @@ schedule_rollback_guard() {
 
 # 后台回滚任务本体（由 schedule_rollback_guard 启动）
 rollback_guard() {
-    local snap="$1" delay="${2:-0}"
+    local snap="$1" delay="${2:-0}" message
     case "$snap" in
         */nft-sh.*) ;;
         *) return 1 ;;
@@ -781,10 +783,14 @@ rollback_guard() {
     # 和前台的确认 / 回滚互斥，避免临近超时时重复恢复或误报确认成功。
     if mkdir "$snap/decision" 2>/dev/null; then
         : > "$snap/rolled_back"
-        restore_snapshot "$snap"
+        if restore_snapshot "$snap"; then
+            message="change was not confirmed in time, firewall rules rolled back"
+        else
+            message="rollback failed; managed firewall table removed to restore access"
+        fi
         : > "$snap/completed"
         if command -v logger >/dev/null 2>&1; then
-            logger -t nft.sh "change was not confirmed in time, firewall rules rolled back"
+            logger -t nft.sh "$message"
         fi
     fi
     : > "$snap/guard_finished"

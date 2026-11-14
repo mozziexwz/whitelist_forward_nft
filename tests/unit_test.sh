@@ -350,18 +350,24 @@ case "${1:-} ${2:-}" in
         ;;
 esac
 if [ "${1:-}" = "-f" ]; then
+    input="$2"
+    if [ "$input" = "-" ]; then
+        input=$(mktemp "$S/stdin.XXXXXX") || exit 1
+        trap 'rm -f "$input"' EXIT
+        cat > "$input"
+    fi
     if [ -e "$S/fail" ]; then
         echo "Error: simulated failure" >&2
         exit 1
     fi
-    cp "$2" "$S/last.nft"
+    cp "$input" "$S/last.nft"
     while read -r a b c d; do
         if [ "$a $b $c" = "delete table inet" ]; then
             rm -f "$S/table_$d"
         fi
-    done < "$2"
-    if grep -q '^table inet unified {' "$2"; then
-        cp "$2" "$S/table_unified"
+    done < "$input"
+    if grep -q '^table inet unified {' "$input"; then
+        cp "$input" "$S/table_unified"
     fi
     exit 0
 fi

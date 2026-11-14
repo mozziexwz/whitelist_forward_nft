@@ -30,15 +30,15 @@
 curl -fsSLO https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/main/nft.sh && bash nft.sh
 ```
 
-推荐：下载固定版本，核对 SHA256 后再运行（把 `v2.0.0` 换成 Releases 页面上的版本）：
+推荐：下载 [v2.0.0 正式版](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.0.0)，核对随版本发布的 SHA256 后再运行：
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/v2.0.0/nft.sh
-sha256sum nft.sh   # 与 Releases 页面公布的值比对一致后再运行
-bash nft.sh
+curl -fsSLO https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.0.0/nft.sh
+curl -fsSLO https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.0.0/SHA256SUMS
+sha256sum -c SHA256SUMS && sudo bash nft.sh
 ```
 
-以上命令需要 root 身份；普通用户请把 `bash nft.sh` 换成 `sudo bash nft.sh`（脚本能在 sudo 下正确识别你的 SSH 来源 IP）。下文的命令同理。
+脚本修改规则时需要 root 身份；普通用户使用 `sudo bash nft.sh`（脚本能在 sudo 下正确识别你的 SSH 来源 IP）。下文的命令同理。
 `help`、`version` 和 `print-rules` 不需要 root；其中规则预览只读取现有配置，不创建文件，也不要求安装 nftables。
 
 首次运行会检测你的 SSH 来源 IP 并建议加入白名单。**白名单默认启用**，请务必先把自己的 IP 加进去。
@@ -113,23 +113,32 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要 IPv4 转发时
 
 - `bash tests/unit_test.sh`：纯 bash 单元测试，不需要 root，Windows 的 Git Bash 也能运行
 - `sudo bash tests/netns_test.sh`：在隔离的 network namespace 里真实加载规则，测试转发和白名单；不改动宿主机的防火墙、`/etc` 和 systemd 服务
-- `shellcheck -S warning nft.sh tests/*.sh`：与 CI 相同的静态检查
+- `shellcheck -S warning nft.sh tests/*.sh scripts/*.sh`：与 CI 相同的静态检查
+- `bash scripts/package_release.sh`：生成 `dist/v2.0.0/nft.sh` 和 `SHA256SUMS`，并校验版本号、LF 换行和产物哈希
 - GitHub Actions 会对每次提交运行 ShellCheck 和上述测试
 
 测试覆盖 TCP/UDP、不同端口段的一一映射、IPv4/IPv6 白名单、普通路由流量不被劫持、持久化失败、安全导入、确认/拒绝/超时回滚，以及终止前台进程后由后台恢复真实规则。每次集成测试使用独立名称的网络命名空间，创建失败会立即停止并清理已创建的资源。
 
+以下验收只用于一次性测试机，会临时加载宿主机规则或改变真实服务状态，执行前会拒绝覆盖已有的本脚本防火墙表：
+
+- `sudo bash tests/systemd_test.sh`：真实 systemd timer 的精度、前台退出后回滚、确认后保留和快照清理
+- `sudo bash tests/coexistence_test.sh`：需要 Docker 和 `wireguard-tools`；验证真实容器映射、容器出站和两个 WireGuard 对等端，退出时清理测试资源
+- `tests/reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：真实重启前后验收；操作方法和已经通过的环境见 [验收记录](docs/VALIDATION.md)
+
+前台确认等待 60 秒；独立后台保护约在 65 秒后尝试恢复。systemd 定时器使用 1 秒精度，SELinux 开启时通过标准输入读取回滚规则，无需关闭 SELinux。
+
 ## 更新说明
 
-### 未发布修正
+### v2.0.0（2026-11-14，首次正式发布）
 
+- 修复 systemd 默认定时精度导致的回滚延迟，完成后自动回收临时单元
+- 修复 RHEL / Rocky Linux 开启 SELinux 时 nft 无法读取临时回滚文件的问题
 - 修复持久化写入失败仍报告成功的问题；使用临时文件替换规则，替换失败保留原文件
 - 对导入和重新应用的转发统一检查 SSH 端口、重叠范围和目标地址；拒绝多余的配置字段
 - 导入时只流式读取唯一的普通文件，不解压归档路径或链接；白名单开关无效时取消整次导入
 - 开启 IPv4 转发失败时停止添加转发；保存快照失败时停止修改配置
 - 应用前启动独立回滚任务，避免确认与后台回滚同时恢复；升级回滚也恢复旧版表，隔离网络中的回滚保留原命名空间
 - `print-rules` 改为完全只读；补充故障路径、IPv6 和前台进程退出后的真实回滚测试
-
-### v2.0.0
 
 - 修复：转发规则会劫持本机发出的流量（如转发 443 后 VPS 上的 apt、curl 都被转走），以及容器 / VPN 客户端访问外网的流量
 - 修复：本地端口段与目标端口段不同时，所有连接都被转到目标段的第一个端口
