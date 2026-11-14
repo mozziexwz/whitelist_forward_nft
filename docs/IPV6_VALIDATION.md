@@ -27,7 +27,7 @@
 | Debian 13.7，Linux `6.12.107+deb13-cloud-amd64`，Jool 4.1.15.0 | 84 项真实内核隔离测试通过；包括并发、故障、回滚和低 MTU |
 | Debian 13 / Jool 4.1.15 | 294 项单元、76 项原 netns、8 项真实 systemd 自定义内核部署回滚通过 |
 | Debian 12，Linux `6.1.0-50-cloud-amd64`，nftables 1.0.6，Jool 4.1.15.0 | 290 项单元、84 项内核、76 项 netns、12 项 systemd 通过；新增上下文 4 项单元由最终 CI 执行 |
-| GitHub Actions / Ubuntu 24.04，Linux `7.0.0-1014-aws`，Jool 4.1.15.0 | 最终运行时代码的 push / PR 两轮各 7 项 CI 全部成功，包括 294 项单元、84 项转换、38 项同号端口、8 项真实 systemd 内核回滚：[push](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43597044395)、[PR](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43597049064) |
+| GitHub Actions / Ubuntu 24.04，Linux `7.0.0-1014-aws`，Jool 4.1.15.0 | 转发核心构建的 push / PR 两轮各 7 项 CI 全部成功，包括 294 项单元、84 项转换、38 项同号端口、8 项真实 systemd 内核回滚：[push](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43597044395)、[PR](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43597049064) |
 | Debian 13 / 真实 systemd | 12 项 timer 测试通过 |
 | Debian 13 / Docker、WireGuard | 原有 13 项真实共存测试通过 |
 | 两台独立双栈公网 VPS | 重启前 8 项、真实重启后 8 项 TCP/UDP 全通过，分别核对入口族、目标族、响应内容及客户端收到的端点 |
@@ -118,3 +118,19 @@ sudo bash tests/kernel_reboot_test.sh cleanup /var/tmp/nft-kernel-reboot-accepta
 ## 开发包
 
 `bash scripts/package_release.sh` 生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，检查 Bash 语法、版本号、LF 和 SHA256。CI 的打包 job 依赖 ShellCheck、单元、netns、systemd、Jool 和 Docker/WireGuard 六项检查；本分支不创建正式标签或替换 Release。
+
+## 缺少 Jool 时的安装流程补充
+
+新增 `install-jool` / `check-jool`（菜单 13 / 14），解决普通 VPS 缺少依赖时只有报错、没有安装入口的问题。当前脚本 SHA256：`08f99fa4f7b18fc61dede3453afe2bb10a3ef0fe477c43c3e64ba1c025e81548`。
+
+| 场景 | 补充前 | 补充后 |
+|---|---|---|
+| 新 VPS 缺少 Jool | 应用时停止，用户自行寻找安装步骤 | 错误列出缺项并提示独立安装命令；可从菜单安装 |
+| 用户安装路径 | CI 专用 DEB 安装，生产用户手动准备 | 用户与 CI 共用固定官方源码 + SHA256 + 当前内核 DKMS 路径 |
+| 工具 / 磁盘 / 已加载版本 | 应用阶段检查 | 独立只读检查，安装前和加载后再次核对；旧版或冲突时不覆盖在用模块 |
+| 部分安装 / 重复安装 | 无专用处理 | 版本匹配时补齐缺失工具或模块；完整匹配时直接复用 |
+| 安装与转发 | 仅安装文档 | 安装命令不初始化转发配置或应用防火墙；成功后由用户重新操作 |
+
+Windows 的 287 项、Debian 13 的 294 项原单元通过。新增 19 项隔离测试覆盖缺失、旧版、版本冲突、下载、校验、DKMS 和加载失败及部分/重复安装；模拟包管理与编译命令，不实际更换系统软件。Debian 13 已安装环境的只读检查与重复安装通过。
+
+GitHub Actions 的内核 job 现在从全新 runner 执行实际 `install-jool`、`check-jool`、重复安装，确认通用 Jool 服务未启动，然后执行原 84 项转换、38 项同号端口及 8 项 systemd 回滚。补充构建：[push](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43603242464)、[PR](https://github.com/mozziexwz/whitelist_forward_nft/actions/runs/43603247376)。RHEL 系安装分支需要可用的 DKMS 仓库和当前内核 devel；本补充未新增 RHEL 全新安装验收，前述 Rocky 转发/重启验收使用已手动安装的相同官方版本。
