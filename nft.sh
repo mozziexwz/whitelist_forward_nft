@@ -603,8 +603,8 @@ build_translation_rules() {
             # Two ingress ports may resolve to the same synthetic endpoint.
             # Allocate distinct source endpoints before Jool, after the host's
             # original-source whitelist check, so reply tuples cannot collapse.
-            post+=("oifname \"$link\" ct status dnat ip6 daddr $synth $p dport $tspec counter masquerade fully-random $cmt")
-            post+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter masquerade $cmt")
+            xpost+=("oifname \"$link\" ct status dnat ip6 daddr $synth $p dport $tspec counter masquerade fully-random $cmt")
+            xpost+=("iifname \"$link\" ip saddr $XL4.64 ip daddr ${f_tip[idx]} $p dport $tspec counter masquerade $cmt")
         done
     else
         alias=$(translation_alias6 "${f_ls[idx]}")
@@ -614,8 +614,8 @@ build_translation_rules() {
             outp+=("ip daddr != 127.0.0.0/8 fib daddr type local $p dport $lspec counter dnat ip to $XL4.128 $cmt")
             xguards+=("oifname \"$link\" ip daddr $XL4.128 $p dport $lspec ct status dnat ct original proto-dst $lspec $source_check counter accept")
             xguards+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ct status dnat ct original ip6 daddr $alias ip6 daddr ${f_tip[idx]} $p dport $tspec counter accept")
-            post+=("oifname \"$link\" fib saddr type local ct status dnat ip daddr $XL4.128 $p dport $lspec counter masquerade $cmt")
-            post+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ct status dnat ct original ip6 daddr $alias ip6 daddr ${f_tip[idx]} $p dport $tspec counter masquerade $cmt")
+            xpost+=("oifname \"$link\" fib saddr type local ct status dnat ip daddr $XL4.128 $p dport $lspec counter masquerade $cmt")
+            xpost+=("iifname \"$link\" ip6 saddr $XL6:46::/96 ct status dnat ct original ip6 daddr $alias ip6 daddr ${f_tip[idx]} $p dport $tspec counter masquerade fully-random $cmt")
         done
     fi
 }
@@ -1205,7 +1205,7 @@ build_ruleset() {
     local e i proto lspec tspec target cmt line policy="accept" family af addr_af host loopback
     local ls le tip ts te
     local -a v4=() v6=() f_ls=() f_le=() f_tip=() f_ts=() f_te=() f_map=() f_family=()
-    local -a pre=() outp=() post=() in_rules=() fw_rules=() xguards=() output_guards=()
+    local -a pre=() outp=() post=() xpost=() in_rules=() fw_rules=() xguards=() output_guards=()
 
     is_whitelist_enabled && policy="drop"
 
@@ -1282,7 +1282,8 @@ build_ruleset() {
     translation_guards || return 1
     emit_chain prerouting "type nat hook prerouting priority dstnat; policy accept;" "${pre[@]}"
     emit_chain output_nat "type nat hook output priority -100; policy accept;" "${outp[@]}"
-    emit_chain postrouting "type nat hook postrouting priority srcnat; policy accept;" "${post[@]}"
+    # Specific translation SNAT must precede native rules for shared targets.
+    emit_chain postrouting "type nat hook postrouting priority srcnat; policy accept;" "${xpost[@]}" "${post[@]}"
     if [ "${#output_guards[@]}" -gt 0 ]; then
         emit_chain translation_route_guard "type filter hook postrouting priority 110; policy accept;" "${output_guards[@]}"
     fi

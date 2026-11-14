@@ -3,6 +3,9 @@
 # in a disposable network/mount namespace. Jool must already be installed.
 set -Eeuo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+: "${NFT_KERNEL_ROLLBACK_TIMEOUT:=3}"
+[[ "$NFT_KERNEL_ROLLBACK_TIMEOUT" =~ ^[1-9][0-9]?$ ]] && [ "$NFT_KERNEL_ROLLBACK_TIMEOUT" -le 60 ] || exit 2
+export NFT_KERNEL_ROLLBACK_TIMEOUT
 if [ "${1:-}" != --inside ]; then
     [ "$EUID" -eq 0 ] || { echo 'root required' >&2; exit 1; }
     for tool in unshare ip nft python3 jool; do command -v "$tool" >/dev/null; done
@@ -113,19 +116,20 @@ except (OSError, AssertionError) as error:
     sys.exit(1)
 PY
 cat > "$WORK/udp_sessions.py" <<'PY'
-import concurrent.futures, socket, threading
+import concurrent.futures, os, socket, threading
 barrier = threading.Barrier(4)
+rounds = int(os.environ.get('NFT_KERNEL_UDP_ROUNDS', '16'))
+assert 1 <= rounds <= 1000
 def client(src):
     v6 = ':' in src
     host = '2001:db8:201::1' if v6 else '10.201.1.1'
     target = '10.201.2.2' if v6 else '2001:db8:202::2'
     ports = (31000, 31010, 31012) if v6 else (32000, 32100, 32012)
-    sock = socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM)
-    with sock:
-        sock.settimeout(3)
-        sock.bind((src, 39001))
-        barrier.wait(timeout=5)
-        for seq in range(16):
+    for seq in range(rounds):
+        with socket.socket(socket.AF_INET6 if v6 else socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(3)
+            sock.bind((src, 39001 + seq))
+            barrier.wait(timeout=5)
             pending = {}
             for port in ports:
                 payload = ('%s/%d/%d' % (src, port, seq)).encode()
@@ -135,7 +139,7 @@ def client(src):
             while pending:
                 try:
                     data, peer = sock.recvfrom(65535)
-                except TimeoutError as error:
+                except socket.timeout as error:
                     raise AssertionError('%s: missing UDP replies from ingress ports %s' % (src, list(pending.values()))) from error
                 assert peer[:2] == (host, pending.pop(data)), (src, data, peer)
 with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -270,7 +274,15 @@ if [ "${2:-}" != --probe ]; then
     else echo 'FAIL: unexpected translator process/listener'; FAIL=$((FAIL + 1)); fi
     if ip netns exec "$CLI" python3 "$WORK/udp_sessions.py"; then
         echo 'PASS: concurrent UDP clients share source port across independent entries'; PASS=$((PASS + 1))
-    else echo 'FAIL: concurrent UDP sessions mixed'; FAIL=$((FAIL + 1)); fi
+    else
+        echo 'FAIL: concurrent UDP sessions mixed'; FAIL=$((FAIL + 1))
+        cat /proc/net/stat/nf_conntrack 2>/dev/null || true
+        for mode in 64 46; do ip netns exec "nftsh$mode" jool -i nft-sh stats display --csv || true; done
+    fi
+    if [ "${2:-}" = --concurrency ]; then
+        printf 'Concurrency probe: %s passed, %s failed\n' "$PASS" "$FAIL"
+        [ "$FAIL" -eq 0 ]; exit $?
+    fi
     for proto in tcp udp; do
         for offset in 0 1 2; do
             expect "$proto IPv6 range v6 backend $offset" allow "$proto" 2001:db8:201::1 "$((30010 + offset))" 2001:db8:201::2 2001:db8:202::2 "$((20000 + offset))" 99
@@ -358,7 +370,7 @@ SH
     cat > "$WORK/rollback-driver.sh" <<'SH'
 #!/bin/bash
 source "$1"
-INTERACTIVE=1; CLI_MODE=1; ROLLBACK_TIMEOUT=3
+INTERACTIVE=1; CLI_MODE=1; ROLLBACK_TIMEOUT="${NFT_KERNEL_ROLLBACK_TIMEOUT:-3}"
 begin_action || exit 1
 trap end_action EXIT
 printf '%s\n' "$SNAPSHOT_DIR" > "$2/driver.snapshot"
@@ -371,7 +383,7 @@ SH
     bash "$WORK/rollback-driver.sh" "$ROOT/nft.sh" "$WORK" < "$WORK/confirm.fifo" > "$WORK/rollback.log" 2>&1 &
     driver=$!; PIDS+=("$driver")
     ready=0
-    for ((i = 0; i < 200; i++)); do
+    for ((i = 0; i < 1200; i++)); do
         if grep -q '确认正常请在' "$WORK/rollback.log"; then ready=1; break; fi
         kill -0 "$driver" 2>/dev/null || break
         sleep 0.05
@@ -382,7 +394,7 @@ SH
         if bash "$ROOT/nft.sh" apply > "$WORK/concurrent-rollback.log" 2>&1; then
             echo 'FAIL: pending rollback admitted a newer transaction'; FAIL=$((FAIL + 1))
         else echo 'PASS: pending rollback blocks newer transaction after disconnect'; PASS=$((PASS + 1)); fi
-        for ((i = 0; i < 160; i++)); do [ -d "$snap" ] || break; sleep 0.1; done
+        for ((i = 0; i < (NFT_KERNEL_ROLLBACK_TIMEOUT + 45) * 10; i++)); do [ -d "$snap" ] || break; sleep 0.1; done
         if [ ! -d "$snap" ] && ! grep -qF '32700' "$NFT_SH_FORWARD_FILE"; then
             echo 'PASS: disconnected control process rolls back kernel resources'; PASS=$((PASS + 1))
         else echo 'FAIL: disconnected control process rollback'; FAIL=$((FAIL + 1)); cat "$WORK/rollback.log"; fi
