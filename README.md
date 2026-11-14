@@ -180,6 +180,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 - `bash tests/unit_test.sh`：纯 bash 单元测试，不需要 root，Windows 的 Git Bash 也能运行
 - `sudo bash tests/netns_test.sh`：在隔离的 network namespace 里真实加载规则，测试转发和白名单；不改动宿主机的防火墙、`/etc` 和 systemd 服务
 - `sudo bash tests/kernel_netns_test.sh`：需已安装匹配的 Jool 工具/模块，在隔离 network/mount namespace 中验证四方向 TCP/UDP、端口段、重复目标、白名单、绕过路径、大包及实例故障恢复
+- `sudo bash tests/kernel_netns_test.sh --same-ports`：额外验证四方向同号端口段保持端口
 - `shellcheck -S warning nft.sh tests/*.sh scripts/*.sh`：与 CI 相同的静态检查
 - `bash scripts/package_release.sh`：按脚本版本生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，并校验版本号、LF 换行和产物哈希；不自动发布
 - GitHub Actions 会对每次提交运行 ShellCheck 和上述测试
@@ -189,6 +190,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 以下验收只用于一次性测试机，会临时加载宿主机规则或改变真实服务状态，执行前会拒绝覆盖已有的本脚本防火墙表：
 
 - `sudo bash tests/systemd_test.sh`：真实 systemd timer 的精度、前台退出后回滚、确认后保留和快照清理
+- `sudo bash tests/kernel_systemd_test.sh`：需要 Jool；强制终止首次自定义部署，验证 systemd 在未继承 shell 环境时恢复正确的内核资源与文件
 - `sudo bash tests/coexistence_test.sh`：需要 Docker 和 `wireguard-tools`；验证真实容器映射、容器出站和两个 WireGuard 对等端，退出时清理测试资源
 - `tests/reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：真实重启前后验收；操作方法和已经通过的环境见 [验收记录](docs/VALIDATION.md)
 - `tests/kernel_reboot_test.sh prepare|verify|cleanup <持久化状态目录>`：四方向跨族启动恢复，配合独立 VPS 上的 `tests/kernel_public_client.py`；操作方法、版本和本分支实测结果见 [IPv6 验收记录](docs/IPV6_VALIDATION.md)

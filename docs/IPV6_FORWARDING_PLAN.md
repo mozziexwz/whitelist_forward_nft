@@ -50,13 +50,15 @@ nftables 支持 IPv6；`inet` 表自 Linux 5.2 起支持带 `ip` / `ip6` 地址�
 
 | 方向 | 入口处理 | Jool 转换 | 出口与回程 |
 |---|---|---|---|
-| IPv6 → IPv4 | 匹配 VPS 本地 IPv6 及端口，按顺序 DNAT 到 `P6` 中编码的 IPv4 目标及目标端口，保留客户端来源用于过滤 | NAT64 将客户端 IPv6 映射为 `Q4` 动态端点，目标还原为 IPv4 | 私有 `Q4` 出口按需 SNAT 成 VPS IPv4；返回先撤销该 SNAT，再经 Jool 及入口 conntrack 撤销 DNAT |
+| IPv6 → IPv4 | 匹配 VPS 本地 IPv6 及端口，按顺序 DNAT 到 `P6` 中编码的 IPv4 目标及目标端口，按原始来源过滤后对进入 veth 的连接做限定 SNAT | NAT64 将入口 SNAT 后的 IPv6 端点映射为 `Q4` 动态端点，目标还原为 IPv4 | 私有 `Q4` 出口按需 SNAT 成 VPS IPv4；返回依次撤销出口 SNAT、Jool 及入口 DNAT/SNAT |
 | IPv4 → IPv6 | 匹配 VPS 本地 IPv4 及端口，DNAT 到 `Q4` 专用服务端点 | 静态 BIB 将该端点映射到 IPv6 服务，IPv4 客户端来源转换为 `P6` 中的表示 | 转换前缀无法在公网回程时，限定 SNAT 成 VPS 可达 IPv6；返回先撤销 SNAT，再经 Jool 与入口 conntrack 返回 IPv4 客户端 |
 
 实现时解决的映射与路由问题：
 
 - 分别生成 TCP、UDP 的 pool4 和静态 BIB；端口段保持等长和顺序，不依靠 DNAT 随机选端口。静态服务池与动态分配池分离，防止地址/端口互相占用。[pool4 配置](https://www.jool.mx/en/usr-flags-pool4.html)
 - BIB 两侧的传输端点在同一协议表内需唯一。多个入口指向同一个 IPv6 目标端点时，为每条声明分配独立的虚拟 IPv6 端点，再由宿主 nft 改写到真实目标，避免重复注册冲突 BIB。[BIB 配置约束](https://www.jool.mx/en/usr-flags-bib.html)
+- 多个 IPv6 入口指向同一 IPv4 目标时，白名单检查后、进入 Jool 前对受管连接做限定 `masquerade fully-random`，分开同一客户端源端口的回复元组；不改变白名单检查使用的原始来源。
+- IPv4→IPv6 的转换出口同样按配置目标使用源端口随机分配；跨族专用 SNAT 排在原生目标规则之前，防止原生规则提前接管相同目标的连接。
 - 双向流量经过同一受管实例及对应 conntrack；补齐 `P6`、`Q4`、veth 中转网段的双向路由。私有池 + 限定 SNAT 已在现有双栈 VPS 验证，不要求额外申请公网 IP。
 - IPv4 主动建连所需的 Jool 外部发起连接/地址依赖过滤设置必须显式管理，并由外层 nft 限制入口及回复端点；不能只添加 BIB 就视为可用。[Jool 过滤参数](https://www.jool.mx/en/usr-flags-global.html)
 - TCP 双向传输、半关闭、超时和重传，以及 UDP 多客户端、连续响应、会话回收、大包、校验和、分片和 ICMP/ICMPv6 错误转换都需真实流量验证。此处评估包级转换，不再采用代理读缓冲或 worker 配置。
@@ -156,10 +158,13 @@ bash nft.sh del-forward --listen-family ipv6 11000
 
 1. 只读预检声明、端口、路由/地址池冲突及工具/模块能力；生成候选配置，记录部署参数、受管实例配置与静态映射、veth/路由、oneshot 单元状态和将修改的 sysctl。
 2. 在任何网络变更前启动独立回滚保护，并加锁防止并发 `apply`、删除或导入互相覆盖。
+   快照同时保存经过定义的运行路径和首次部署参数，独立 systemd 任务按数据恢复，不能依赖 shell 环境继承。
 3. 先建立外层过滤和未转换包的拒绝路径，再准备隔离实例、池及静态 BIB；确认完整后才启用宿主入口引流，不能出现无保护的转换窗口。
 4. 校验 nft、各实例、映射、双向路由和持久化配置一致后，再完成交互确认；任一阶段失败都返回非零并恢复。
 5. 未确认、SSH 断开或控制命令被终止时，先封闭或撤销新引流，再按依赖顺序恢复旧实例配置、静态 BIB、路由、本项目 nft 表、文件及本次修改的 sysctl。保护规则恢复失败时须先断开转换路径，再执行 SSH 恢复措施。
 6. 启动单元须先加载必要过滤与隔离资源，最后开放引流；加载失败时跨族入口保持不可达。重建实例可能丢失动态 BIB/session 及现有 TCP/UDP 状态，回滚只承诺恢复配置和新建连接能力，不能声称恢复原连接的内存状态。
+
+控制工具通过 util-linux `nsenter --net` 进入专用网络空间，避免 `ip -n` 隐式重挂 `/sys`。该路径已在 Rocky SELinux Enforcing 的真实 systemd 定时器中验证。
 
 nft 与 Jool 各自的批量配置能力不组成跨系统事务；路由、namespace、文件和 sysctl 按阶段恢复。实测 Jool 的文件更新会忽略 BIB 部分，因此声明改变时重建专用实例；仅修改白名单且实例、池、映射和路由完整时不重建。[Jool 原子配置](https://www.jool.mx/en/config-atomic.html)
 
