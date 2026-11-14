@@ -1,6 +1,6 @@
 # v2.1.0 分支 IPv6 验收记录
 
-日期：2026-11-14。开发与验收分支：`codex/ipv6-kernel-forwarding`；本次交付合并至 `main`，合并后清理功能分支。v2.1.0 包含 IPv6→IPv6、IPv6→IPv4、IPv4→IPv6；旧 IPv4→IPv4 继续保留。正式 v2.0.0 的标签和附件未替换，尚未创建 v2.1.0 Release。
+日期：2026-11-14。开发与验收分支 `codex/ipv6-kernel-forwarding` 已合并至 `main` 并清理。v2.1.0 包含 IPv6→IPv6、IPv6→IPv4、IPv4→IPv6；旧 IPv4→IPv4 继续保留。v2.1.0 Release 提供独立脚本和 SHA256SUMS，旧 v2.0.0 的标签和附件保留。
 
 转发核心及下述真实重启验收脚本 SHA256：`46f7d8520ad75af6ba10fd74c5784efe947fafeff152c7b5f5340192760b6943`。后续依赖安装补充见文末记录。
 
@@ -117,7 +117,7 @@ sudo bash tests/kernel_reboot_test.sh cleanup /var/tmp/nft-kernel-reboot-accepta
 
 ## 开发包
 
-`bash scripts/package_release.sh` 生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，检查 Bash 语法、版本号、LF 和 SHA256。CI 的打包 job 依赖 ShellCheck、单元、netns、systemd、Jool、Docker/WireGuard 和 Debian 三版本矩阵检查；本次合并不创建正式标签或替换 Release。
+`bash scripts/package_release.sh` 生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，检查 Bash 语法、版本号、LF 和 SHA256。CI 的打包 job 依赖 ShellCheck、单元、netns、systemd、Jool、Docker/WireGuard 和 Debian 三版本矩阵检查。Release 工作流校验标签与脚本版本，要求同一提交通过主分支 CI；先上传草稿附件并下载逐字节和 SHA256 复核，再公开发布。已发布的附件不覆盖。
 
 ## 缺少 Jool 时的安装流程补充
 

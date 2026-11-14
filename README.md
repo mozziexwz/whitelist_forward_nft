@@ -2,7 +2,7 @@
 
 懒人一键脚本：基于 nftables 的 **IP 白名单防火墙 + 端口转发（TCP+UDP）**，适合用 VPS 做中转。
 
-主分支代码为 **v2.1.0**，包含下述 IPv6 / 内核跨族转发。新增功能请下载 `main` 的 `nft.sh`；已发布的 v2.0.0 Release 仍只支持 IPv4→IPv4，v2.1.0 尚未单独创建 Release。
+最新正式版为 **[v2.1.0](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.1.0)**，包含下述 IPv6 / 内核跨族转发，提供独立脚本和 SHA256 校验文件。主分支保留后续开发更新；旧 v2.0.0 仍只支持 IPv4→IPv4。
 
 ## 功能
 
@@ -68,20 +68,21 @@ sudo bash nft.sh install-jool
 
 ## 安装与运行
 
-下载主分支代码（包含 IPv6 与内核跨族转发）：
+推荐下载 v2.1.0 正式版，校验后运行：
 
 ```bash
-curl -fL https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/main/nft.sh -o nft.sh
-sudo bash nft.sh
-```
-
-需要旧版（仅 IPv4→IPv4）时，可下载 [v2.0.0 正式版](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.0.0)，核对随版本发布的 SHA256 后再运行：
-
-```bash
-curl -fsSLO https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.0.0/nft.sh
-curl -fsSLO https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.0.0/SHA256SUMS
+curl -fL https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.1.0/nft.sh -o nft.sh &&
+curl -fL https://github.com/mozziexwz/whitelist_forward_nft/releases/download/v2.1.0/SHA256SUMS -o SHA256SUMS &&
 sha256sum -c SHA256SUMS && sudo bash nft.sh
 ```
+
+需要主分支最新代码时：
+
+```bash
+curl -fL https://raw.githubusercontent.com/mozziexwz/whitelist_forward_nft/main/nft.sh -o nft.sh && sudo bash nft.sh
+```
+
+旧版仅 IPv4 转发可下载 [v2.0.0](https://github.com/mozziexwz/whitelist_forward_nft/releases/tag/v2.0.0)；降级前先恢复旧配置并撤销跨族资源。
 
 脚本修改规则时需要 root 身份；普通用户使用 `sudo bash nft.sh`（脚本能在 sudo 下正确识别你的 SSH 来源 IP）。下文的命令同理。
 `help`、`version`、`check-jool`、`print-rules` 和 `print-plan` 不主动修改系统。预览不要求安装 nftables/Jool，但需要能够读取声明及部署配置；系统部署目录仅 root 可访问时，请用 `sudo` 预览。
@@ -205,6 +206,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 - `shellcheck -S warning nft.sh tests/*.sh scripts/*.sh`：与 CI 相同的静态检查
 - `bash scripts/package_release.sh`：按脚本版本生成 `dist/v2.1.0/nft.sh` 和 `SHA256SUMS`，并校验版本号、LF 换行和产物哈希；不自动发布
 - GitHub Actions 会对每次提交运行 ShellCheck 和上述测试
+- 发布使用 `vX.Y.Z` 标签：Release 工作流要求该提交已通过主分支 CI，版本号与标签一致；附件上传到草稿并下载校验后再公开，已发布附件不覆盖。
 
 测试覆盖 TCP/UDP、不同端口段的一一映射、IPv4/IPv6 白名单、普通路由流量不被劫持、持久化失败、安全导入、确认/拒绝/超时回滚，以及终止前台进程后由后台恢复真实规则。每次集成测试使用独立名称的网络命名空间，创建失败会立即停止并清理已创建的资源。
 
@@ -220,7 +222,7 @@ rm -f /etc/sysctl.d/99-nft-sh-forward.conf   # 不再需要本脚本持久化转
 
 ## 更新说明
 
-### v2.1.0（主分支代码，尚未创建 Release）
+### v2.1.0
 
 - 新增 IPv6→IPv6、IPv6→IPv4、IPv4→IPv6 的 TCP/UDP 和端口段映射
 - 同族使用 nft，跨族使用专用 namespace 中的 Jool 内核转换，无常驻用户态中继
